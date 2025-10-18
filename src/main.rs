@@ -16,8 +16,10 @@ const TAGGED_HASH_CONTEXT_SIGNATURE: &[u8] = b"fullagg-signature-secp256k1-Sha25
 type Keypair = (SecretKey, PublicKey);
 type NoncePair = (Scalar, ProjectivePoint);
 type Message = Vec<u8>;
-/// Individual signer's public key, R1, R2, and message
-type ContextItem = (PublicKey, ProjectivePoint, ProjectivePoint, Message);
+/// Individual signer's public key, message, and individual R2
+type ContextItem = (PublicKey, Message, ProjectivePoint);
+
+type SignerList = Vec<(PublicKey, Message)>;
 
 struct Signer<SignerState> {
     state: SignerState,
@@ -27,6 +29,80 @@ impl<SignerState> Deref for Signer<SignerState> {
     type Target = SignerState;
     fn deref(&self) -> &Self::Target {
         &self.state
+    }
+}
+
+struct Coordinator<CoordinatorState> {
+    state: CoordinatorState,
+}
+
+impl<CoordinatorState> Deref for Coordinator<CoordinatorState> {
+    type Target = CoordinatorState;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+struct CollectingNonces {
+    context: Vec<ContextItem>,
+}
+
+impl Coordinator<CollectingNonces> {
+    pub fn new() -> Coordinator<CollectingNonces> {
+        Coordinator {
+            state: CollectingNonces {
+                context: Vec::new(),
+            },
+        }
+    }
+
+    pub fn add_nonce(&mut self, nonce: ContextItem) {
+        self.state.context.push(nonce);
+    }
+
+    /// Returns the context and the group nonce
+    pub fn collect_nonces(&self) -> (Context, Coordinator<CollectingSignatures>) {
+        let group_nonce_R1 = self
+            .context
+            .iter()
+            .map(|item| item.2)
+            .sum::<ProjectivePoint>();
+        let group_nonce_R2 = self
+            .context
+            .iter()
+            .map(|item| item.2)
+            .sum::<ProjectivePoint>();
+        let context = Context {
+            context: self.context.clone(),
+            group_nonce_R1,
+            group_nonce_R2,
+        };
+        (
+            context.clone(),
+            Coordinator {
+                state: CollectingSignatures {
+                    context,
+                    signatures: Vec::new(),
+                },
+            },
+        )
+    }
+}
+
+struct CollectingSignatures {
+    context: Context,
+    signatures: Vec<Scalar>,
+}
+
+impl Coordinator<CollectingSignatures> {
+    pub fn add_signature(&mut self, signature: Scalar) {
+        self.state.signatures.push(signature);
+    }
+
+    pub fn collect_signatures(&self) -> (Scalar, ProjectivePoint) {
+        let signature = self.state.signatures.iter().sum::<Scalar>();
+        let group_nonce = self.state.context.group_nonce();
+        (signature, group_nonce)
     }
 }
 
@@ -71,6 +147,10 @@ struct WithNonces {
 }
 
 impl Signer<WithNonces> {
+    pub fn context_item(&self, message: Message) -> ContextItem {
+        (self.keypair.1, message, self.r2.1)
+    }
+
     pub fn with_context(&self, context: Context) -> Signer<WithContext> {
         Signer {
             state: WithContext {
@@ -83,33 +163,49 @@ impl Signer<WithNonces> {
     }
 }
 
+#[derive(Debug, Clone)]
 struct Context {
+    group_nonce_R1: ProjectivePoint,
+    group_nonce_R2: ProjectivePoint,
     context: Vec<ContextItem>,
+}
+
+/// Digest the hasher to a Scalar
+fn hasher_to_scalar(hasher: Sha256) -> Scalar {
+    // This is acceptable because secp256k1 curve order is close to 2^256,
+    // and the input is uniformly random since it is a hash output, therefore
+    // the bias is negligibly small.
+    Scalar::reduce(U256::from_be_slice(&hasher.finalize()))
 }
 
 impl Context {
     fn tagged_hash(&self) -> Sha256 {
         let mut hasher = Sha256::new();
         hasher.update(TAGGED_HASH_CONTEXT_NONCE);
+        hasher.update(self.group_nonce_R1.to_affine().x());
+        hasher.update(self.group_nonce_R2.to_affine().x());
         for item in self.context.iter() {
             hasher.update(item.0.to_projective().to_affine().x());
-            hasher.update(item.1.to_affine().x());
+            hasher.update(&item.1);
             hasher.update(item.2.to_affine().x());
-            hasher.update(&item.3);
         }
         hasher
     }
 
-    /// Digest the hasher to a Scalar
-    fn hasher_to_scalar(hasher: Sha256) -> Scalar {
-        // This is acceptable because secp256k1 curve order is close to 2^256,
-        // and the input is uniformly random since it is a hash output, therefore
-        // the bias is negligibly small.
-        Scalar::reduce(U256::from_be_slice(&hasher.finalize()))
+    pub(crate) fn beta(&self) -> Scalar {
+        hasher_to_scalar(self.tagged_hash())
     }
 
-    pub(crate) fn beta(&self) -> Scalar {
-        Self::hasher_to_scalar(self.tagged_hash())
+    pub(crate) fn group_nonce(&self) -> ProjectivePoint {
+        let beta = self.beta();
+        self.group_nonce_R1 + self.group_nonce_R2 * beta
+    }
+
+    pub(crate) fn signer_list(&self) -> SignerList {
+        self.context
+            .iter()
+            .map(|item| (item.0.clone(), item.1.clone()))
+            .collect()
     }
 }
 
@@ -121,15 +217,49 @@ struct WithContext {
 }
 
 impl Signer<WithContext> {
-    fn effective_nonce(&self) -> Scalar {
-        let beta = self.context.beta();
-        let effective_nonce = self.r1.0 + beta * self.r2.0;
-        effective_nonce
+    fn challenge(&self, singer_list: SignerList) -> Scalar {
+        let mut hasher = Sha256::new();
+        hasher.update(TAGGED_HASH_CONTEXT_SIGNATURE);
+        hasher.update(self.context.group_nonce().to_affine().x());
+        // Hash my pk one extra time ?
+        hasher.update(self.keypair.1.to_projective().to_affine().x());
+        for (pk, message) in singer_list.iter() {
+            hasher.update(pk.to_projective().to_affine().x());
+            hasher.update(&message);
+        }
+        hasher_to_scalar(hasher)
     }
-    pub fn sign(&self, message: Message) -> Signature {
-        todo!()
+
+    pub fn sign(&self, message: Message) -> Scalar {
+        let mut counter = 0;
+        for (_, _, r2) in self.context.context.iter() {
+            if *r2 == self.r2.1 {
+                counter += 1;
+            }
+        }
+        // Ensure that our R2 is on the list only once
+        assert!(counter == 1);
+        // TODO ensure our public key message is correct from the context at an earlier stage
+        let beta = self.context.beta();
+        let challenge = self.challenge(self.context.signer_list());
+        let br2 = self.r2.0 * beta;
+        let csk = self.keypair.0.to_nonzero_scalar().mul(&challenge);
+        let s = self.r1.0 + br2 + csk;
+        s
     }
 }
 
 fn main() {
+    let mut coordinator = Coordinator::new();
+    let signer_1 = Signer::new_keypair().generate_nonces();
+    let signer_2 = Signer::new_keypair().generate_nonces();
+    let signer_3 = Signer::new_keypair().generate_nonces();
+
+    let message = b"cisa is cool".to_vec();
+
+    coordinator.add_nonce(signer_1.context_item(message.clone()));
+    coordinator.add_nonce(signer_2.context_item(message.clone()));
+    coordinator.add_nonce(signer_3.context_item(message.clone()));
+
+    let context = coordinator.collect_nonces();
 }
