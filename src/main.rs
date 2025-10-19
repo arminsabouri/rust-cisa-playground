@@ -3,7 +3,6 @@ use std::ops::Deref;
 use k256::{
     ProjectivePoint, PublicKey, Scalar, SecretKey, U256,
     elliptic_curve::{Field, ops::Reduce, rand_core::OsRng},
-    schnorr::Signature,
     sha2::Digest,
 };
 
@@ -13,12 +12,14 @@ use k256::sha2::Sha256;
 const TAGGED_HASH_CONTEXT_NONCE: &[u8] = b"fullagg-nonce-secp256k1-Sha256-v0";
 const TAGGED_HASH_CONTEXT_SIGNATURE: &[u8] = b"fullagg-signature-secp256k1-Sha256-v0";
 
+/// Private and public key for a signer
 type Keypair = (SecretKey, PublicKey);
+/// Private and public nonces for a signer
 type NoncePair = (Scalar, ProjectivePoint);
 type Message = Vec<u8>;
-/// Individual signer's public key, message, and individual R2
-type ContextItem = (PublicKey, Message, ProjectivePoint);
-
+/// Individual signer's public key, message, and individual R1, R2
+type ContextItem = (PublicKey, Message, ProjectivePoint, ProjectivePoint);
+/// Signer list is a list of public keys and messages
 type SignerList = Vec<(PublicKey, Message)>;
 
 struct Signer<SignerState> {
@@ -61,31 +62,28 @@ impl Coordinator<CollectingNonces> {
     }
 
     /// Returns the context and the group nonce
-    pub fn collect_nonces(&self) -> (Context, Coordinator<CollectingSignatures>) {
-        let group_nonce_R1 = self
+    pub fn collect_nonces(&self) -> Coordinator<CollectingSignatures> {
+        let group_nonce_r1 = self
             .context
             .iter()
             .map(|item| item.2)
             .sum::<ProjectivePoint>();
-        let group_nonce_R2 = self
+        let group_nonce_r2 = self
             .context
             .iter()
-            .map(|item| item.2)
+            .map(|item| item.3)
             .sum::<ProjectivePoint>();
         let context = Context {
             context: self.context.clone(),
-            group_nonce_R1,
-            group_nonce_R2,
+            group_nonce_r1,
+            group_nonce_r2,
         };
-        (
-            context.clone(),
-            Coordinator {
-                state: CollectingSignatures {
-                    context,
-                    signatures: Vec::new(),
-                },
+        Coordinator {
+            state: CollectingSignatures {
+                context,
+                signatures: Vec::new(),
             },
-        )
+        }
     }
 }
 
@@ -95,6 +93,10 @@ struct CollectingSignatures {
 }
 
 impl Coordinator<CollectingSignatures> {
+    pub fn context(&self) -> Context {
+        self.state.context.clone()
+    }
+
     pub fn add_signature(&mut self, signature: Scalar) {
         self.state.signatures.push(signature);
     }
@@ -106,6 +108,7 @@ impl Coordinator<CollectingSignatures> {
     }
 }
 
+#[allow(dead_code)]
 struct Init;
 impl Signer<Init> {
     pub fn new_keypair() -> Signer<WithKeypair> {
@@ -128,12 +131,12 @@ impl Signer<WithKeypair> {
     pub fn generate_nonces(&self) -> Signer<WithNonces> {
         let r1 = Scalar::random(&mut OsRng);
         let r2 = Scalar::random(&mut OsRng);
-        let R1 = ProjectivePoint::GENERATOR * r1;
-        let R2 = ProjectivePoint::GENERATOR * r2;
+        let r1_point = ProjectivePoint::GENERATOR * r1;
+        let r2_point = ProjectivePoint::GENERATOR * r2;
         Signer {
             state: WithNonces {
-                r1: (r1, R1),
-                r2: (r2, R2),
+                r1: (r1, r1_point),
+                r2: (r2, r2_point),
                 keypair: self.keypair.clone(),
             },
         }
@@ -148,7 +151,7 @@ struct WithNonces {
 
 impl Signer<WithNonces> {
     pub fn context_item(&self, message: Message) -> ContextItem {
-        (self.keypair.1, message, self.r2.1)
+        (self.keypair.1, message, self.r1.1, self.r2.1)
     }
 
     pub fn with_context(&self, context: Context) -> Signer<WithContext> {
@@ -165,8 +168,8 @@ impl Signer<WithNonces> {
 
 #[derive(Debug, Clone)]
 struct Context {
-    group_nonce_R1: ProjectivePoint,
-    group_nonce_R2: ProjectivePoint,
+    group_nonce_r1: ProjectivePoint,
+    group_nonce_r2: ProjectivePoint,
     context: Vec<ContextItem>,
 }
 
@@ -182,12 +185,12 @@ impl Context {
     fn tagged_hash(&self) -> Sha256 {
         let mut hasher = Sha256::new();
         hasher.update(TAGGED_HASH_CONTEXT_NONCE);
-        hasher.update(self.group_nonce_R1.to_affine().x());
-        hasher.update(self.group_nonce_R2.to_affine().x());
-        for item in self.context.iter() {
-            hasher.update(item.0.to_projective().to_affine().x());
-            hasher.update(&item.1);
-            hasher.update(item.2.to_affine().x());
+        hasher.update(self.group_nonce_r1.to_affine().x());
+        hasher.update(self.group_nonce_r2.to_affine().x());
+        for (pk, message, _, r2) in self.context.iter() {
+            hasher.update(pk.to_projective().to_affine().x());
+            hasher.update(&message);
+            hasher.update(r2.to_affine().x());
         }
         hasher
     }
@@ -198,7 +201,7 @@ impl Context {
 
     pub(crate) fn group_nonce(&self) -> ProjectivePoint {
         let beta = self.beta();
-        self.group_nonce_R1 + self.group_nonce_R2 * beta
+        self.group_nonce_r1 + (self.group_nonce_r2 * beta)
     }
 
     pub(crate) fn signer_list(&self) -> SignerList {
@@ -216,23 +219,28 @@ struct WithContext {
     context: Context,
 }
 
-impl Signer<WithContext> {
-    fn challenge(&self, singer_list: SignerList) -> Scalar {
-        let mut hasher = Sha256::new();
-        hasher.update(TAGGED_HASH_CONTEXT_SIGNATURE);
-        hasher.update(self.context.group_nonce().to_affine().x());
-        // Hash my pk one extra time ?
-        hasher.update(self.keypair.1.to_projective().to_affine().x());
-        for (pk, message) in singer_list.iter() {
-            hasher.update(pk.to_projective().to_affine().x());
-            hasher.update(&message);
-        }
-        hasher_to_scalar(hasher)
+fn challenge(
+    signer_list: &SignerList,
+    group_nonce: &ProjectivePoint,
+    pk: &PublicKey,
+    message: &Message,
+) -> Scalar {
+    let mut hasher = Sha256::new();
+    hasher.update(TAGGED_HASH_CONTEXT_SIGNATURE);
+    hasher.update(group_nonce.to_affine().x());
+    hasher.update(pk.to_projective().to_affine().x());
+    hasher.update(message);
+    for (signer_pk, signer_message) in signer_list.iter() {
+        hasher.update(signer_pk.to_projective().to_affine().x());
+        hasher.update(signer_message);
     }
+    hasher_to_scalar(hasher)
+}
 
-    pub fn sign(&self, message: Message) -> Scalar {
+impl Signer<WithContext> {
+    pub fn sign(&self, message: &Message) -> Scalar {
         let mut counter = 0;
-        for (_, _, r2) in self.context.context.iter() {
+        for (_, _, _, r2) in self.context.context.iter() {
             if *r2 == self.r2.1 {
                 counter += 1;
             }
@@ -241,12 +249,31 @@ impl Signer<WithContext> {
         assert!(counter == 1);
         // TODO ensure our public key message is correct from the context at an earlier stage
         let beta = self.context.beta();
-        let challenge = self.challenge(self.context.signer_list());
+        let challenge = challenge(
+            &self.context.signer_list(),
+            &self.context.group_nonce(),
+            &self.keypair.1,
+            message,
+        );
         let br2 = self.r2.0 * beta;
         let csk = self.keypair.0.to_nonzero_scalar().mul(&challenge);
         let s = self.r1.0 + br2 + csk;
         s
     }
+}
+
+pub fn verify(s: Scalar, group_nonce: ProjectivePoint, signer_list: &SignerList) -> bool {
+    let gs = ProjectivePoint::GENERATOR * s;
+    let rhs = group_nonce
+        + signer_list
+            .iter()
+            .map(|(pk, message)| {
+                let c = challenge(signer_list, &group_nonce, pk, message);
+                let x = pk.to_projective() * c;
+                x
+            })
+            .sum::<ProjectivePoint>();
+    gs == rhs
 }
 
 fn main() {
@@ -255,11 +282,36 @@ fn main() {
     let signer_2 = Signer::new_keypair().generate_nonces();
     let signer_3 = Signer::new_keypair().generate_nonces();
 
-    let message = b"cisa is cool".to_vec();
+    let mut messages = Vec::new();
+    for i in 0..3 {
+        messages.push(format!("cisa is cool {}", i).as_bytes().to_vec());
+    }
 
-    coordinator.add_nonce(signer_1.context_item(message.clone()));
-    coordinator.add_nonce(signer_2.context_item(message.clone()));
-    coordinator.add_nonce(signer_3.context_item(message.clone()));
+    coordinator.add_nonce(signer_1.context_item(messages[0].clone()));
+    coordinator.add_nonce(signer_2.context_item(messages[1].clone()));
+    coordinator.add_nonce(signer_3.context_item(messages[2].clone()));
 
-    let context = coordinator.collect_nonces();
+    let mut coordinator = coordinator.collect_nonces();
+
+    let singature_1 = signer_1
+        .with_context(coordinator.context())
+        .sign(&messages[0]);
+    let singature_2 = signer_2
+        .with_context(coordinator.context())
+        .sign(&messages[1]);
+    let singature_3 = signer_3
+        .with_context(coordinator.context())
+        .sign(&messages[2]);
+
+    coordinator.add_signature(singature_1);
+    coordinator.add_signature(singature_2);
+    coordinator.add_signature(singature_3);
+
+    let (signature, group_nonce) = coordinator.collect_signatures();
+    println!("signature: {:?}", signature);
+    println!("group_nonce: {:?}", group_nonce);
+
+    let verify = verify(signature, group_nonce, &coordinator.context().signer_list());
+    assert!(verify);
+    println!("verify: {:?}", verify);
 }
