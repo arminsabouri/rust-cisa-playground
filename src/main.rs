@@ -101,6 +101,7 @@ impl Coordinator<CollectingSignatures> {
         self.state.signatures.push(signature);
     }
 
+    /// Coordinator collects the signatures and computes the group signature and group nonce
     pub fn collect_signatures(&self) -> (Scalar, ProjectivePoint) {
         let signature = self.state.signatures.iter().sum::<Scalar>();
         let group_nonce = self.state.context.group_nonce();
@@ -111,6 +112,7 @@ impl Coordinator<CollectingSignatures> {
 #[allow(dead_code)]
 struct Init;
 impl Signer<Init> {
+    /// Signer generates their private and public key
     pub fn new_keypair() -> Signer<WithKeypair> {
         let sk = SecretKey::random(&mut OsRng);
         let pk = sk.public_key();
@@ -125,9 +127,7 @@ struct WithKeypair {
 }
 
 impl Signer<WithKeypair> {
-    /// Signer generates their secret nonces r1_i and r2_i and computes the
-    /// public nonces R1_i and R2_i from them.
-    /// Then they store state st_i and send out_i to the coordinator.
+    /// Signer generates their secret nonces r1 and r2 and computes the public nonces R1 and R2 from them.
     pub fn generate_nonces(&self) -> Signer<WithNonces> {
         let r1 = Scalar::random(&mut OsRng);
         let r2 = Scalar::random(&mut OsRng);
@@ -150,10 +150,12 @@ struct WithNonces {
 }
 
 impl Signer<WithNonces> {
+    // TODO: message should be part of the WithNonces state, NOT a parameter. that can lead to nonce reuse for different messages
     pub fn context_item(&self, message: Message) -> ContextItem {
         (self.keypair.1, message, self.r1.1, self.r2.1)
     }
 
+    /// Signer adds the context to their state and can now sign
     pub fn with_context(&self, context: Context) -> Signer<WithContext> {
         Signer {
             state: WithContext {
@@ -204,6 +206,7 @@ impl Context {
         self.group_nonce_r1 + (self.group_nonce_r2 * beta)
     }
 
+    /// Returns the signer list which consists of a tuple of public keys and messages
     pub(crate) fn signer_list(&self) -> SignerList {
         self.context
             .iter()
@@ -238,6 +241,7 @@ fn challenge(
 }
 
 impl Signer<WithContext> {
+    /// Signer signs the message and returns their partial signature
     pub fn sign(&self, message: &Message) -> Scalar {
         let mut counter = 0;
         for (_, _, _, r2) in self.context.context.iter() {
@@ -262,6 +266,7 @@ impl Signer<WithContext> {
     }
 }
 
+/// Verifies the group signature and group nonce
 pub fn verify(s: Scalar, group_nonce: ProjectivePoint, signer_list: &SignerList) -> bool {
     let gs = ProjectivePoint::GENERATOR * s;
     let rhs = group_nonce
