@@ -1,7 +1,7 @@
 use std::ops::Deref;
 
 use k256::{
-    ProjectivePoint, PublicKey, Scalar, SecretKey, U256,
+    ProjectivePoint, Scalar, U256,
     elliptic_curve::{Field, ops::Reduce, rand_core::OsRng},
     sha2::Digest,
 };
@@ -12,8 +12,6 @@ use k256::sha2::Sha256;
 const TAGGED_HASH_CONTEXT_NONCE: &[u8] = b"fullagg-nonce-secp256k1-Sha256-v0";
 const TAGGED_HASH_CONTEXT_SIGNATURE: &[u8] = b"fullagg-signature-secp256k1-Sha256-v0";
 
-/// Private and public key for a signer
-type Keypair = (SecretKey, PublicKey);
 /// Private and public nonces for a signer
 type NoncePair = (Scalar, ProjectivePoint);
 type Message = Vec<u8>;
@@ -21,6 +19,33 @@ type Message = Vec<u8>;
 type ContextItem = (PublicKey, Message, ProjectivePoint, ProjectivePoint);
 /// Signer list is a list of public keys and messages
 type SignerList = Vec<(PublicKey, Message)>;
+/// Public key is a group element
+type PublicKey = ProjectivePoint;
+
+#[derive(Clone)]
+struct SignerKey {
+    private_key: Scalar,
+    tweak: Option<Scalar>,
+}
+
+impl SignerKey {
+    pub fn new_random(tweak: Option<Scalar>) -> SignerKey {
+        let private_key = Scalar::random(&mut OsRng);
+        SignerKey { private_key, tweak }
+    }
+
+    pub fn public_key(&self) -> ProjectivePoint {
+        ProjectivePoint::GENERATOR * self.private_key()
+    }
+
+    pub fn private_key(&self) -> Scalar {
+        if let Some(tweak) = self.tweak {
+            self.private_key * tweak
+        } else {
+            self.private_key
+        }
+    }
+}
 
 struct Signer<SignerState> {
     state: SignerState,
@@ -113,17 +138,16 @@ impl Coordinator<CollectingSignatures> {
 struct Init;
 impl Signer<Init> {
     /// Signer generates their private and public key
-    pub fn new_keypair() -> Signer<WithKeypair> {
-        let sk = SecretKey::random(&mut OsRng);
-        let pk = sk.public_key();
+    pub fn new_keypair(tweak: Option<Scalar>) -> Signer<WithKeypair> {
+        let signer_key = SignerKey::new_random(tweak);
         Signer {
-            state: WithKeypair { keypair: (sk, pk) },
+            state: WithKeypair { signer_key },
         }
     }
 }
 
 struct WithKeypair {
-    keypair: Keypair,
+    signer_key: SignerKey,
 }
 
 impl Signer<WithKeypair> {
@@ -137,7 +161,7 @@ impl Signer<WithKeypair> {
             state: WithNonces {
                 r1: (r1, r1_point),
                 r2: (r2, r2_point),
-                keypair: self.keypair.clone(),
+                signer_key: self.signer_key.clone(),
             },
         }
     }
@@ -146,13 +170,13 @@ impl Signer<WithKeypair> {
 struct WithNonces {
     r1: NoncePair,
     r2: NoncePair,
-    keypair: Keypair,
+    signer_key: SignerKey,
 }
 
 impl Signer<WithNonces> {
     // TODO: message should be part of the WithNonces state, NOT a parameter. that can lead to nonce reuse for different messages
     pub fn context_item(&self, message: Message) -> ContextItem {
-        (self.keypair.1, message, self.r1.1, self.r2.1)
+        (self.signer_key.public_key(), message, self.r1.1, self.r2.1)
     }
 
     /// Signer adds the context to their state and can now sign
@@ -161,7 +185,7 @@ impl Signer<WithNonces> {
             state: WithContext {
                 r1: self.r1,
                 r2: self.r2,
-                keypair: self.keypair.clone(),
+                signer_key: self.signer_key.clone(),
                 context,
             },
         }
@@ -190,7 +214,7 @@ impl Context {
         hasher.update(self.group_nonce_r1.to_affine().x());
         hasher.update(self.group_nonce_r2.to_affine().x());
         for (pk, message, _, r2) in self.context.iter() {
-            hasher.update(pk.to_projective().to_affine().x());
+            hasher.update(pk.to_affine().x());
             hasher.update(&message);
             hasher.update(r2.to_affine().x());
         }
@@ -218,8 +242,8 @@ impl Context {
 struct WithContext {
     r1: NoncePair,
     r2: NoncePair,
-    keypair: Keypair,
     context: Context,
+    signer_key: SignerKey,
 }
 
 fn challenge(
@@ -231,10 +255,10 @@ fn challenge(
     let mut hasher = Sha256::new();
     hasher.update(TAGGED_HASH_CONTEXT_SIGNATURE);
     hasher.update(group_nonce.to_affine().x());
-    hasher.update(pk.to_projective().to_affine().x());
+    hasher.update(pk.to_affine().x());
     hasher.update(message);
     for (signer_pk, signer_message) in signer_list.iter() {
-        hasher.update(signer_pk.to_projective().to_affine().x());
+        hasher.update(signer_pk.to_affine().x());
         hasher.update(signer_message);
     }
     hasher_to_scalar(hasher)
@@ -256,11 +280,12 @@ impl Signer<WithContext> {
         let challenge = challenge(
             &self.context.signer_list(),
             &self.context.group_nonce(),
-            &self.keypair.1,
+            &self.signer_key.public_key(),
             message,
         );
         let br2 = self.r2.0 * beta;
-        let csk = self.keypair.0.to_nonzero_scalar().mul(&challenge);
+        let sk = self.signer_key.private_key();
+        let csk = sk * challenge;
         let s = self.r1.0 + br2 + csk;
         s
     }
@@ -274,7 +299,7 @@ pub fn verify(s: Scalar, group_nonce: ProjectivePoint, signer_list: &SignerList)
             .iter()
             .map(|(pk, message)| {
                 let c = challenge(signer_list, &group_nonce, pk, message);
-                let x = pk.to_projective() * c;
+                let x = *pk * c;
                 x
             })
             .sum::<ProjectivePoint>();
@@ -283,9 +308,9 @@ pub fn verify(s: Scalar, group_nonce: ProjectivePoint, signer_list: &SignerList)
 
 fn main() {
     let mut coordinator = Coordinator::new();
-    let signer_1 = Signer::new_keypair().generate_nonces();
-    let signer_2 = Signer::new_keypair().generate_nonces();
-    let signer_3 = Signer::new_keypair().generate_nonces();
+    let signer_1 = Signer::new_keypair(None).generate_nonces();
+    let signer_2 = Signer::new_keypair(None).generate_nonces();
+    let signer_3 = Signer::new_keypair(None).generate_nonces();
 
     let mut messages = Vec::new();
     for i in 0..3 {
@@ -313,10 +338,39 @@ fn main() {
     coordinator.add_signature(singature_3);
 
     let (signature, group_nonce) = coordinator.collect_signatures();
-    println!("signature: {:?}", signature);
-    println!("group_nonce: {:?}", group_nonce);
+    let res = verify(signature, group_nonce, &coordinator.context().signer_list());
+    assert!(res);
 
-    let verify = verify(signature, group_nonce, &coordinator.context().signer_list());
-    assert!(verify);
-    println!("verify: {:?}", verify);
+    // Generate some random scalar tweaks
+    let mut tweaks = Vec::new();
+    for _ in 0..3 {
+        tweaks.push(Scalar::random(&mut OsRng));
+    }
+    let mut coordinator = Coordinator::new();
+    let signer_1 = Signer::new_keypair(Some(tweaks[0])).generate_nonces();
+    let signer_2 = Signer::new_keypair(Some(tweaks[1])).generate_nonces();
+    let signer_3 = Signer::new_keypair(Some(tweaks[2])).generate_nonces();
+    coordinator.add_context_item(signer_1.context_item(messages[0].clone()));
+    coordinator.add_context_item(signer_2.context_item(messages[1].clone()));
+    coordinator.add_context_item(signer_3.context_item(messages[2].clone()));
+
+    let mut coordinator = coordinator.collect_nonces();
+
+    let singature_1 = signer_1
+        .with_context(coordinator.context())
+        .sign(&messages[0]);
+    let singature_2 = signer_2
+        .with_context(coordinator.context())
+        .sign(&messages[1]);
+    let singature_3 = signer_3
+        .with_context(coordinator.context())
+        .sign(&messages[2]);
+
+    coordinator.add_signature(singature_1);
+    coordinator.add_signature(singature_2);
+    coordinator.add_signature(singature_3);
+
+    let (signature, group_nonce) = coordinator.collect_signatures();
+    let res = verify(signature, group_nonce, &coordinator.context().signer_list());
+    assert!(res);
 }
