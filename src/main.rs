@@ -57,8 +57,8 @@ impl Coordinator<CollectingNonces> {
         }
     }
 
-    pub fn add_nonce(&mut self, nonce: ContextItem) {
-        self.state.context.push(nonce);
+    pub fn add_context_item(&mut self, context_item: ContextItem) {
+        self.state.context.push(context_item);
     }
 
     /// Returns the context and the group nonce
@@ -292,9 +292,9 @@ fn main() {
         messages.push(format!("cisa is cool {}", i).as_bytes().to_vec());
     }
 
-    coordinator.add_nonce(signer_1.context_item(messages[0].clone()));
-    coordinator.add_nonce(signer_2.context_item(messages[1].clone()));
-    coordinator.add_nonce(signer_3.context_item(messages[2].clone()));
+    coordinator.add_context_item(signer_1.context_item(messages[0].clone()));
+    coordinator.add_context_item(signer_2.context_item(messages[1].clone()));
+    coordinator.add_context_item(signer_3.context_item(messages[2].clone()));
 
     let mut coordinator = coordinator.collect_nonces();
 
