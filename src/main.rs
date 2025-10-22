@@ -307,69 +307,51 @@ pub fn verify(s: Scalar, group_nonce: ProjectivePoint, signer_list: &SignerList)
 }
 
 fn main() {
+    // TODO: this should be converted to a library and main should be a test
     let mut coordinator = Coordinator::new();
-    let signer_1 = Signer::new_keypair(None).generate_nonces();
-    let signer_2 = Signer::new_keypair(None).generate_nonces();
-    let signer_3 = Signer::new_keypair(None).generate_nonces();
-
+    let singers = vec![
+        Signer::new_keypair(None).generate_nonces(),
+        Signer::new_keypair(None).generate_nonces(),
+        Signer::new_keypair(None).generate_nonces(),
+    ];
     let mut messages = Vec::new();
     for i in 0..3 {
         messages.push(format!("cisa is cool {}", i).as_bytes().to_vec());
     }
-
-    coordinator.add_context_item(signer_1.context_item(messages[0].clone()));
-    coordinator.add_context_item(signer_2.context_item(messages[1].clone()));
-    coordinator.add_context_item(signer_3.context_item(messages[2].clone()));
+    for (i, singer) in singers.iter().enumerate() {
+        coordinator.add_context_item(singer.context_item(messages[i].clone()));
+    }
 
     let mut coordinator = coordinator.collect_nonces();
 
-    let singature_1 = signer_1
-        .with_context(coordinator.context())
-        .sign(&messages[0]);
-    let singature_2 = signer_2
-        .with_context(coordinator.context())
-        .sign(&messages[1]);
-    let singature_3 = signer_3
-        .with_context(coordinator.context())
-        .sign(&messages[2]);
-
-    coordinator.add_signature(singature_1);
-    coordinator.add_signature(singature_2);
-    coordinator.add_signature(singature_3);
+    for (i, singer) in singers.iter().enumerate() {
+        let signature = singer
+            .with_context(coordinator.context())
+            .sign(&messages[i]);
+        coordinator.add_signature(signature);
+    }
 
     let (signature, group_nonce) = coordinator.collect_signatures();
     let res = verify(signature, group_nonce, &coordinator.context().signer_list());
     assert!(res);
 
-    // Generate some random scalar tweaks
-    let mut tweaks = Vec::new();
-    for _ in 0..3 {
-        tweaks.push(Scalar::random(&mut OsRng));
-    }
+    // Test with tweaks
     let mut coordinator = Coordinator::new();
-    let signer_1 = Signer::new_keypair(Some(tweaks[0])).generate_nonces();
-    let signer_2 = Signer::new_keypair(Some(tweaks[1])).generate_nonces();
-    let signer_3 = Signer::new_keypair(Some(tweaks[2])).generate_nonces();
-    coordinator.add_context_item(signer_1.context_item(messages[0].clone()));
-    coordinator.add_context_item(signer_2.context_item(messages[1].clone()));
-    coordinator.add_context_item(signer_3.context_item(messages[2].clone()));
-
+    let singers = vec![
+        Signer::new_keypair(Some(Scalar::random(&mut OsRng))).generate_nonces(),
+        Signer::new_keypair(Some(Scalar::random(&mut OsRng))).generate_nonces(),
+        Signer::new_keypair(Some(Scalar::random(&mut OsRng))).generate_nonces(),
+    ];
+    for (i, singer) in singers.iter().enumerate() {
+        coordinator.add_context_item(singer.context_item(messages[i].clone()));
+    }
     let mut coordinator = coordinator.collect_nonces();
-
-    let singature_1 = signer_1
-        .with_context(coordinator.context())
-        .sign(&messages[0]);
-    let singature_2 = signer_2
-        .with_context(coordinator.context())
-        .sign(&messages[1]);
-    let singature_3 = signer_3
-        .with_context(coordinator.context())
-        .sign(&messages[2]);
-
-    coordinator.add_signature(singature_1);
-    coordinator.add_signature(singature_2);
-    coordinator.add_signature(singature_3);
-
+    for (i, singer) in singers.iter().enumerate() {
+        let signature = singer
+            .with_context(coordinator.context())
+            .sign(&messages[i]);
+        coordinator.add_signature(signature);
+    }
     let (signature, group_nonce) = coordinator.collect_signatures();
     let res = verify(signature, group_nonce, &coordinator.context().signer_list());
     assert!(res);
