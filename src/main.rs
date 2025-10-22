@@ -309,7 +309,7 @@ pub fn verify(s: Scalar, group_nonce: ProjectivePoint, signer_list: &SignerList)
 fn main() {
     // TODO: this should be converted to a library and main should be a test
     let mut coordinator = Coordinator::new();
-    let singers = vec![
+    let signers = vec![
         Signer::new_keypair(None).generate_nonces(),
         Signer::new_keypair(None).generate_nonces(),
         Signer::new_keypair(None).generate_nonces(),
@@ -318,13 +318,13 @@ fn main() {
     for i in 0..3 {
         messages.push(format!("cisa is cool {}", i).as_bytes().to_vec());
     }
-    for (i, singer) in singers.iter().enumerate() {
+    for (i, singer) in signers.iter().enumerate() {
         coordinator.add_context_item(singer.context_item(messages[i].clone()));
     }
 
     let mut coordinator = coordinator.collect_nonces();
 
-    for (i, singer) in singers.iter().enumerate() {
+    for (i, singer) in signers.iter().enumerate() {
         let signature = singer
             .with_context(coordinator.context())
             .sign(&messages[i]);
@@ -337,16 +337,16 @@ fn main() {
 
     // Test with tweaks
     let mut coordinator = Coordinator::new();
-    let singers = vec![
+    let signers = vec![
         Signer::new_keypair(Some(Scalar::random(&mut OsRng))).generate_nonces(),
         Signer::new_keypair(Some(Scalar::random(&mut OsRng))).generate_nonces(),
         Signer::new_keypair(Some(Scalar::random(&mut OsRng))).generate_nonces(),
     ];
-    for (i, singer) in singers.iter().enumerate() {
+    for (i, singer) in signers.iter().enumerate() {
         coordinator.add_context_item(singer.context_item(messages[i].clone()));
     }
     let mut coordinator = coordinator.collect_nonces();
-    for (i, singer) in singers.iter().enumerate() {
+    for (i, singer) in signers.iter().enumerate() {
         let signature = singer
             .with_context(coordinator.context())
             .sign(&messages[i]);
