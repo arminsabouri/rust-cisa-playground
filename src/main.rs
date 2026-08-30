@@ -12,6 +12,14 @@ use k256::sha2::Sha256;
 const TAG_NONCECOEF: &[u8] = b"FullAgg/noncecoef";
 const TAG_SIG: &[u8] = b"FullAgg/sig";
 
+fn cbytes(point: &ProjectivePoint) -> [u8; 33] {
+    let affine = point.to_affine();
+    let mut out = [0u8; 33];
+    out[0] = if bool::from(affine.y_is_odd()) { 0x03 } else { 0x02 };
+    out[1..].copy_from_slice(&affine.x());
+    out
+}
+
 fn tagged_hasher(tag: &[u8]) -> Sha256 {
     let tag_hash = Sha256::digest(tag);
     let mut hasher = Sha256::new();
@@ -218,12 +226,12 @@ fn hasher_to_scalar(hasher: Sha256) -> Scalar {
 impl Context {
     fn tagged_hash(&self) -> Sha256 {
         let mut hasher = tagged_hasher(TAG_NONCECOEF);
-        hasher.update(self.group_nonce_r1.to_affine().x());
-        hasher.update(self.group_nonce_r2.to_affine().x());
+        hasher.update(cbytes(&self.group_nonce_r1));
+        hasher.update(cbytes(&self.group_nonce_r2));
         for (pk, message, _, r2) in self.context.iter() {
             hasher.update(pk.to_affine().x());
             hasher.update(&message);
-            hasher.update(r2.to_affine().x());
+            hasher.update(cbytes(r2));
         }
         hasher
     }
