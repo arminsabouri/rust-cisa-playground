@@ -9,8 +9,16 @@ use k256::{
 use k256::elliptic_curve::point::AffineCoordinates;
 use k256::sha2::Sha256;
 
-const TAGGED_HASH_CONTEXT_NONCE: &[u8] = b"fullagg-nonce-secp256k1-Sha256-v0";
-const TAGGED_HASH_CONTEXT_SIGNATURE: &[u8] = b"fullagg-signature-secp256k1-Sha256-v0";
+const TAG_NONCECOEF: &[u8] = b"FullAgg/noncecoef";
+const TAG_SIG: &[u8] = b"FullAgg/sig";
+
+fn tagged_hasher(tag: &[u8]) -> Sha256 {
+    let tag_hash = Sha256::digest(tag);
+    let mut hasher = Sha256::new();
+    hasher.update(tag_hash);
+    hasher.update(tag_hash);
+    hasher
+}
 
 /// Private and public nonces for a signer
 type NoncePair = (Scalar, ProjectivePoint);
@@ -209,8 +217,7 @@ fn hasher_to_scalar(hasher: Sha256) -> Scalar {
 
 impl Context {
     fn tagged_hash(&self) -> Sha256 {
-        let mut hasher = Sha256::new();
-        hasher.update(TAGGED_HASH_CONTEXT_NONCE);
+        let mut hasher = tagged_hasher(TAG_NONCECOEF);
         hasher.update(self.group_nonce_r1.to_affine().x());
         hasher.update(self.group_nonce_r2.to_affine().x());
         for (pk, message, _, r2) in self.context.iter() {
@@ -252,8 +259,7 @@ fn challenge(
     pk: &PublicKey,
     message: &Message,
 ) -> Scalar {
-    let mut hasher = Sha256::new();
-    hasher.update(TAGGED_HASH_CONTEXT_SIGNATURE);
+    let mut hasher = tagged_hasher(TAG_SIG);
     hasher.update(group_nonce.to_affine().x());
     hasher.update(pk.to_affine().x());
     hasher.update(message);
