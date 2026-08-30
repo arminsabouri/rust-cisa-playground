@@ -22,7 +22,7 @@ fn tagged_hasher(tag: &[u8]) -> Sha256 {
 
 /// Private and public nonces for a signer
 type NoncePair = (Scalar, ProjectivePoint);
-type Message = Vec<u8>;
+type Message = [u8; 32];
 /// Individual signer's public key, message, and individual R1, R2
 type ContextItem = (PublicKey, Message, ProjectivePoint, ProjectivePoint);
 /// Signer list is a list of public keys and messages
@@ -320,9 +320,12 @@ fn main() {
         Signer::new_keypair(None).generate_nonces(),
         Signer::new_keypair(None).generate_nonces(),
     ];
-    let mut messages = Vec::new();
+    let mut messages: Vec<Message> = Vec::new();
     for i in 0..3 {
-        messages.push(format!("cisa is cool {}", i).as_bytes().to_vec());
+        let digest = Sha256::digest(format!("cisa is cool {}", i));
+        let mut message = [0u8; 32];
+        message.copy_from_slice(&digest);
+        messages.push(message);
     }
     for (i, singer) in signers.iter().enumerate() {
         coordinator.add_context_item(singer.context_item(messages[i].clone()));
