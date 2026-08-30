@@ -481,3 +481,100 @@ fn main() {
     let res = verify(signature, group_nonce, &coordinator.context().signer_list());
     assert!(res);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k256::FieldBytes;
+    use k256::elliptic_curve::PrimeField;
+
+    // "Two-member full-aggregation group with SIGHASH_ALL (using deterministic
+    // nonces)" from bip-0460/wallet-test-vectors.json in
+    // https://github.com/bitcoin/bips/pull/2212. The signature messages are the
+    // BIP 460 sighashes and the keys are the taproot tweaked keys, both of which
+    // that BIP derives from the transaction before handing them to BIP 459.
+    const TWEAKED_PRIVKEYS: [&str; 2] = [
+        "1071bcc060fecee099b8826465a20e691fd1d65ff6f1bef9600d8454e080bc29",
+        "0506bdad0f203954d2194a9955bf7b92d4b238360ceabc4a2b96d5cabea9ae5b",
+    ];
+    const WITNESS_PROGRAMS: [&str; 2] = [
+        "8640c68f13b51a1e63dfc5cc41202cca21c18f1f9d7037c2cbec3f03f63e52e4",
+        "18b6491469cc78b764b01669b0a5a4e892f57e8c1b20b89bc1ca6dce3e881b51",
+    ];
+    const SIG_HASHES: [&str; 2] = [
+        "9339267f5f6715d1b7e1b26bd69e13689b3872be5fa0c50a9d90daf9f2ae46cc",
+        "d2982e6665e1e964ecefa2a747b19f17ad46d6765e284d639c293647c9349857",
+    ];
+    const SECNONCES: [&str; 2] = [
+        "87c33dcedc7db5994d68278a81a4693ee961d08ef7e3fdeab611ab8061e92dd4\
+         517ac39af981926ed1124224dfe721c6dc0769a8ea24d2e2fc2636c3b1e9ca15",
+        "3c4b7832dd37bbdb955ebf900769d133d55161e5c6ad9e09c2efa4ace1ba2e15\
+         3d007745e9f74e6b8a47651a672111b07589261401674263a40e286340bcefea",
+    ];
+    const PUBNONCES: [&str; 2] = [
+        "021be5111aa027a4b7368d88cb0f5419f7b530e17e41af6fe7a611a03abc9bab63\
+         020e72955a3c53f163a1373ac5233ad30ff8bb4ef69dad424d91529c0ef6329ac6",
+        "0367b7d091e6b58f7e94e9228393bc6b777e9fbe0186e9fce56248c9177c96f65e\
+         03592137dea3431dbb0fbe1287c35f8e44a30d68e62486969d21e90d2b4c68f05e",
+    ];
+    const AGGREGATE_SIGNATURE: &str =
+        "f00c224cc4e1bb038b1f35d71c28608510236327924d350d75520eb6295eb190\
+         8a38b68c0a7b484bc4ac7330ae2f5e909bf25b53fa60131f7d6799d5017311d8";
+
+    fn hex(value: &str) -> Vec<u8> {
+        let value: String = value.chars().filter(|c| !c.is_whitespace()).collect();
+        (0..value.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&value[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn scalar(bytes: &[u8]) -> Scalar {
+        Scalar::from_repr(FieldBytes::from(<[u8; 32]>::try_from(bytes).unwrap())).unwrap()
+    }
+
+    fn message(value: &str) -> Message {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&hex(value));
+        out
+    }
+
+    #[test]
+    fn bip460_full_aggregation_vector() {
+        let messages: Vec<Message> = SIG_HASHES.iter().map(|m| message(m)).collect();
+        let signers: Vec<Signer<WithNonces>> = (0..2)
+            .map(|i| {
+                let secnonce = hex(SECNONCES[i]);
+                Signer::from_private_key(scalar(&hex(TWEAKED_PRIVKEYS[i])), None)
+                    .with_nonces(scalar(&secnonce[..32]), scalar(&secnonce[32..]))
+            })
+            .collect();
+
+        for (i, signer) in signers.iter().enumerate() {
+            assert_eq!(
+                &signer.signer_key.public_key().to_affine().x()[..],
+                &hex(WITNESS_PROGRAMS[i])[..]
+            );
+            let mut pubnonce = cbytes(&signer.r1.1).to_vec();
+            pubnonce.extend_from_slice(&cbytes(&signer.r2.1));
+            assert_eq!(pubnonce, hex(PUBNONCES[i]));
+        }
+
+        let mut coordinator = Coordinator::new();
+        for (i, signer) in signers.iter().enumerate() {
+            coordinator.add_context_item(signer.context_item(messages[i]));
+        }
+        let mut coordinator = coordinator.collect_nonces();
+        for (i, signer) in signers.iter().enumerate() {
+            let signature = signer.with_context(coordinator.context()).sign(&messages[i]);
+            coordinator.add_signature(signature);
+        }
+
+        let (signature, group_nonce) = coordinator.collect_signatures();
+        assert_eq!(
+            serialize_signature(&group_nonce, &signature).as_slice(),
+            hex(AGGREGATE_SIGNATURE).as_slice()
+        );
+        assert!(verify(signature, group_nonce, &coordinator.context().signer_list()));
+    }
+}
