@@ -305,14 +305,19 @@ impl Signer<WithContext> {
     /// Signer signs the message and returns their partial signature
     pub fn sign(&self, message: &Message) -> Scalar {
         let mut counter = 0;
-        for (_, _, _, r2) in self.context.context.iter() {
+        let mut index = None;
+        for (i, (_, _, _, r2)) in self.context.context.iter().enumerate() {
             if *r2 == self.r2.1 {
                 counter += 1;
+                index = Some(i);
             }
         }
         // Ensure that our R2 is on the list only once
         assert!(counter == 1);
-        // TODO ensure our public key message is correct from the context at an earlier stage
+        // Ensure the coordinator paired our nonce with our own key and message
+        let (context_pk, context_message, _, _) = &self.context.context[index.unwrap()];
+        assert!(context_pk.to_affine().x() == self.signer_key.public_key().to_affine().x());
+        assert!(context_message == message);
         let beta = self.context.beta();
         let group_nonce = self.context.group_nonce();
         let public_key = self.signer_key.public_key();
