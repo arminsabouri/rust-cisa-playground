@@ -2,13 +2,15 @@ use std::ops::Deref;
 
 use k256::{
     ProjectivePoint, Scalar, U256,
-    elliptic_curve::{Field, ops::Reduce, rand_core::OsRng},
+    elliptic_curve::{Field, ops::Reduce, rand_core::{OsRng, RngCore}},
     sha2::Digest,
 };
 
 use k256::elliptic_curve::point::AffineCoordinates;
 use k256::sha2::Sha256;
 
+const TAG_AUX: &[u8] = b"FullAgg/aux";
+const TAG_NONCE: &[u8] = b"FullAgg/nonce";
 const TAG_NONCECOEF: &[u8] = b"FullAgg/noncecoef";
 const TAG_SIG: &[u8] = b"FullAgg/sig";
 
@@ -187,11 +189,33 @@ struct WithKeypair {
     signer_key: SignerKey,
 }
 
+fn nonce_gen(sk: Scalar) -> (Scalar, Scalar) {
+    let mut rand_prime = [0u8; 32];
+    OsRng.fill_bytes(&mut rand_prime);
+    let mut hasher = tagged_hasher(TAG_AUX);
+    hasher.update(rand_prime);
+    let aux = hasher.finalize();
+    let sk_bytes = sk.to_bytes();
+    let mut rand = [0u8; 32];
+    for i in 0..32 {
+        rand[i] = sk_bytes[i] ^ aux[i];
+    }
+    let nonce = |counter: u8| {
+        let mut hasher = tagged_hasher(TAG_NONCE);
+        hasher.update(rand);
+        hasher.update([counter]);
+        hasher_to_scalar(hasher)
+    };
+    let r1 = nonce(0);
+    let r2 = nonce(1);
+    assert!(r1 != Scalar::ZERO && r2 != Scalar::ZERO);
+    (r1, r2)
+}
+
 impl Signer<WithKeypair> {
     /// Signer generates their secret nonces r1 and r2 and computes the public nonces R1 and R2 from them.
     pub fn generate_nonces(&self) -> Signer<WithNonces> {
-        let r1 = Scalar::random(&mut OsRng);
-        let r2 = Scalar::random(&mut OsRng);
+        let (r1, r2) = nonce_gen(self.signer_key.private_key());
         let r1_point = ProjectivePoint::GENERATOR * r1;
         let r2_point = ProjectivePoint::GENERATOR * r2;
         Signer {
