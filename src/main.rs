@@ -45,14 +45,20 @@ type SignerList = Vec<(PublicKey, Message)>;
 /// Public key is a group element
 type PublicKey = ProjectivePoint;
 
+#[derive(Clone, Copy)]
+struct Tweak {
+    value: Scalar,
+    is_xonly: bool,
+}
+
 #[derive(Clone)]
 struct SignerKey {
     private_key: Scalar,
-    tweak: Option<Scalar>,
+    tweak: Option<Tweak>,
 }
 
 impl SignerKey {
-    pub fn new_random(tweak: Option<Scalar>) -> SignerKey {
+    pub fn new_random(tweak: Option<Tweak>) -> SignerKey {
         let private_key = Scalar::random(&mut OsRng);
         SignerKey { private_key, tweak }
     }
@@ -63,7 +69,13 @@ impl SignerKey {
 
     pub fn private_key(&self) -> Scalar {
         if let Some(tweak) = self.tweak {
-            self.private_key * tweak
+            let untweaked = ProjectivePoint::GENERATOR * self.private_key;
+            let d = if !tweak.is_xonly || has_even_y(&untweaked) {
+                self.private_key
+            } else {
+                -self.private_key
+            };
+            d + tweak.value
         } else {
             self.private_key
         }
@@ -163,7 +175,7 @@ impl Coordinator<CollectingSignatures> {
 struct Init;
 impl Signer<Init> {
     /// Signer generates their private and public key
-    pub fn new_keypair(tweak: Option<Scalar>) -> Signer<WithKeypair> {
+    pub fn new_keypair(tweak: Option<Tweak>) -> Signer<WithKeypair> {
         let signer_key = SignerKey::new_random(tweak);
         Signer {
             state: WithKeypair { signer_key },
@@ -374,9 +386,21 @@ fn main() {
     // Test with tweaks
     let mut coordinator = Coordinator::new();
     let signers = vec![
-        Signer::new_keypair(Some(Scalar::random(&mut OsRng))).generate_nonces(),
-        Signer::new_keypair(Some(Scalar::random(&mut OsRng))).generate_nonces(),
-        Signer::new_keypair(Some(Scalar::random(&mut OsRng))).generate_nonces(),
+        Signer::new_keypair(Some(Tweak {
+            value: Scalar::random(&mut OsRng),
+            is_xonly: true,
+        }))
+        .generate_nonces(),
+        Signer::new_keypair(Some(Tweak {
+            value: Scalar::random(&mut OsRng),
+            is_xonly: true,
+        }))
+        .generate_nonces(),
+        Signer::new_keypair(Some(Tweak {
+            value: Scalar::random(&mut OsRng),
+            is_xonly: true,
+        }))
+        .generate_nonces(),
     ];
     for (i, singer) in signers.iter().enumerate() {
         coordinator.add_context_item(singer.context_item(messages[i].clone()));
