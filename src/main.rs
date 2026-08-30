@@ -12,11 +12,18 @@ use k256::sha2::Sha256;
 const TAG_NONCECOEF: &[u8] = b"FullAgg/noncecoef";
 const TAG_SIG: &[u8] = b"FullAgg/sig";
 
+fn has_even_y(point: &ProjectivePoint) -> bool {
+    !bool::from(point.to_affine().y_is_odd())
+}
+
+fn lift_x(point: &ProjectivePoint) -> ProjectivePoint {
+    if has_even_y(point) { *point } else { -*point }
+}
+
 fn cbytes(point: &ProjectivePoint) -> [u8; 33] {
-    let affine = point.to_affine();
     let mut out = [0u8; 33];
-    out[0] = if bool::from(affine.y_is_odd()) { 0x03 } else { 0x02 };
-    out[1..].copy_from_slice(&affine.x());
+    out[0] = if has_even_y(point) { 0x02 } else { 0x03 };
+    out[1..].copy_from_slice(&point.to_affine().x());
     out
 }
 
@@ -295,16 +302,24 @@ impl Signer<WithContext> {
         assert!(counter == 1);
         // TODO ensure our public key message is correct from the context at an earlier stage
         let beta = self.context.beta();
+        let group_nonce = self.context.group_nonce();
+        let public_key = self.signer_key.public_key();
         let challenge = challenge(
             &self.context.signer_list(),
-            &self.context.group_nonce(),
-            &self.signer_key.public_key(),
+            &group_nonce,
+            &public_key,
             message,
         );
-        let br2 = self.r2.0 * beta;
+        // Negate so that the aggregate verifies against the x-only group nonce
+        // and the x-only public keys.
+        let e = if has_even_y(&group_nonce) {
+            Scalar::ONE
+        } else {
+            -Scalar::ONE
+        };
         let sk = self.signer_key.private_key();
-        let csk = sk * challenge;
-        let s = self.r1.0 + br2 + csk;
+        let d = if has_even_y(&public_key) { sk } else { -sk };
+        let s = e * (self.r1.0 + (self.r2.0 * beta)) + (challenge * d);
         s
     }
 }
@@ -312,12 +327,12 @@ impl Signer<WithContext> {
 /// Verifies the group signature and group nonce
 pub fn verify(s: Scalar, group_nonce: ProjectivePoint, signer_list: &SignerList) -> bool {
     let gs = ProjectivePoint::GENERATOR * s;
-    let rhs = group_nonce
+    let rhs = lift_x(&group_nonce)
         + signer_list
             .iter()
             .map(|(pk, message)| {
                 let c = challenge(signer_list, &group_nonce, pk, message);
-                let x = *pk * c;
+                let x = lift_x(pk) * c;
                 x
             })
             .sum::<ProjectivePoint>();
