@@ -162,6 +162,8 @@ impl Coordinator<CollectingSignatures> {
     }
 
     pub fn add_signature(&mut self, signature: Scalar) {
+        let index = self.state.signatures.len();
+        assert!(partial_sig_verify(&self.state.context, signature, index));
         self.state.signatures.push(signature);
     }
 
@@ -323,6 +325,19 @@ fn challenge(
     hasher.update(pk.to_affine().x());
     hasher.update(message);
     hasher_to_scalar(hasher)
+}
+
+fn partial_sig_verify(context: &Context, psig: Scalar, index: usize) -> bool {
+    let (pk, message, r1, r2) = &context.context[index];
+    let group_nonce = context.group_nonce();
+    let e = if has_even_y(&group_nonce) {
+        Scalar::ONE
+    } else {
+        -Scalar::ONE
+    };
+    let c = challenge(&context.signer_list(), &group_nonce, pk, message);
+    let r_eff = *r1 + (*r2 * context.beta());
+    ProjectivePoint::GENERATOR * psig == (r_eff * e) + (lift_x(pk) * c)
 }
 
 impl Signer<WithContext> {
