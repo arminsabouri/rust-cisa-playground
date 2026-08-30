@@ -185,6 +185,15 @@ impl Signer<Init> {
             state: WithKeypair { signer_key },
         }
     }
+
+    #[allow(dead_code)]
+    pub fn from_private_key(private_key: Scalar, tweak: Option<Tweak>) -> Signer<WithKeypair> {
+        Signer {
+            state: WithKeypair {
+                signer_key: SignerKey { private_key, tweak },
+            },
+        }
+    }
 }
 
 struct WithKeypair {
@@ -218,6 +227,10 @@ impl Signer<WithKeypair> {
     /// Signer generates their secret nonces r1 and r2 and computes the public nonces R1 and R2 from them.
     pub fn generate_nonces(&self) -> Signer<WithNonces> {
         let (r1, r2) = nonce_gen(self.signer_key.private_key());
+        self.with_nonces(r1, r2)
+    }
+
+    pub fn with_nonces(&self, r1: Scalar, r2: Scalar) -> Signer<WithNonces> {
         let r1_point = ProjectivePoint::GENERATOR * r1;
         let r2_point = ProjectivePoint::GENERATOR * r2;
         Signer {
@@ -378,6 +391,14 @@ impl Signer<WithContext> {
         let s = e * (self.r1.0 + (self.r2.0 * beta)) + (challenge * d);
         s
     }
+}
+
+#[allow(dead_code)]
+fn serialize_signature(group_nonce: &ProjectivePoint, s: &Scalar) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    out[..32].copy_from_slice(&group_nonce.to_affine().x());
+    out[32..].copy_from_slice(&s.to_bytes());
+    out
 }
 
 /// Verifies the group signature and group nonce
