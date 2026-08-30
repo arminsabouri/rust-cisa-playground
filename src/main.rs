@@ -260,13 +260,13 @@ fn challenge(
     message: &Message,
 ) -> Scalar {
     let mut hasher = tagged_hasher(TAG_SIG);
-    hasher.update(group_nonce.to_affine().x());
-    hasher.update(pk.to_affine().x());
-    hasher.update(message);
     for (signer_pk, signer_message) in signer_list.iter() {
         hasher.update(signer_pk.to_affine().x());
         hasher.update(signer_message);
     }
+    hasher.update(group_nonce.to_affine().x());
+    hasher.update(pk.to_affine().x());
+    hasher.update(message);
     hasher_to_scalar(hasher)
 }
 
