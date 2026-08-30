@@ -114,6 +114,8 @@ impl Coordinator<CollectingNonces> {
             .iter()
             .map(|item| item.3)
             .sum::<ProjectivePoint>();
+        assert!(group_nonce_r1 != ProjectivePoint::IDENTITY);
+        assert!(group_nonce_r2 != ProjectivePoint::IDENTITY);
         let context = Context {
             context: self.context.clone(),
             group_nonce_r1,
@@ -242,7 +244,9 @@ impl Context {
 
     pub(crate) fn group_nonce(&self) -> ProjectivePoint {
         let beta = self.beta();
-        self.group_nonce_r1 + (self.group_nonce_r2 * beta)
+        let group_nonce = self.group_nonce_r1 + (self.group_nonce_r2 * beta);
+        assert!(group_nonce != ProjectivePoint::IDENTITY);
+        group_nonce
     }
 
     /// Returns the signer list which consists of a tuple of public keys and messages
