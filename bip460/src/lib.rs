@@ -1,3 +1,7 @@
+// BIP 460 Pass 3 verifies a full-aggregation group with Verify as defined in
+// BIP 459, over the group's ordered public key and message lists.
+pub use bip459::{Message, PublicKey, verify as verify_full_agg};
+
 // Marker bytes and sighash epoch defined by BIP 460. The marker is the last
 // byte of the witness element of the final input of an aggregation group.
 pub const HALF_AGG_MARKER: u8 = 0xbc;

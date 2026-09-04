@@ -38,23 +38,23 @@ fn tagged_hasher(tag: &[u8]) -> Sha256 {
 }
 
 /// Private and public nonces for a signer
-type NoncePair = (Scalar, ProjectivePoint);
-type Message = [u8; 32];
+pub type NoncePair = (Scalar, ProjectivePoint);
+pub type Message = [u8; 32];
 /// Individual signer's public key, message, and individual R1, R2
-type ContextItem = (PublicKey, Message, ProjectivePoint, ProjectivePoint);
+pub type ContextItem = (PublicKey, Message, ProjectivePoint, ProjectivePoint);
 /// Signer list is a list of public keys and messages
-type SignerList = Vec<(PublicKey, Message)>;
+pub type SignerList = Vec<(PublicKey, Message)>;
 /// Public key is a group element
-type PublicKey = ProjectivePoint;
+pub type PublicKey = ProjectivePoint;
 
 #[derive(Clone, Copy)]
-struct Tweak {
-    value: Scalar,
-    is_xonly: bool,
+pub struct Tweak {
+    pub value: Scalar,
+    pub is_xonly: bool,
 }
 
 #[derive(Clone)]
-struct SignerKey {
+pub struct SignerKey {
     private_key: Scalar,
     tweak: Option<Tweak>,
 }
@@ -84,7 +84,7 @@ impl SignerKey {
     }
 }
 
-struct Signer<SignerState> {
+pub struct Signer<SignerState> {
     state: SignerState,
 }
 
@@ -95,7 +95,7 @@ impl<SignerState> Deref for Signer<SignerState> {
     }
 }
 
-struct Coordinator<CoordinatorState> {
+pub struct Coordinator<CoordinatorState> {
     state: CoordinatorState,
 }
 
@@ -106,7 +106,7 @@ impl<CoordinatorState> Deref for Coordinator<CoordinatorState> {
     }
 }
 
-struct CollectingNonces {
+pub struct CollectingNonces {
     context: Vec<ContextItem>,
 }
 
@@ -151,7 +151,7 @@ impl Coordinator<CollectingNonces> {
     }
 }
 
-struct CollectingSignatures {
+pub struct CollectingSignatures {
     context: Context,
     signatures: Vec<Scalar>,
 }
@@ -175,8 +175,7 @@ impl Coordinator<CollectingSignatures> {
     }
 }
 
-#[allow(dead_code)]
-struct Init;
+pub struct Init;
 impl Signer<Init> {
     /// Signer generates their private and public key
     pub fn new_keypair(tweak: Option<Tweak>) -> Signer<WithKeypair> {
@@ -186,8 +185,7 @@ impl Signer<Init> {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn from_private_key(private_key: Scalar, tweak: Option<Tweak>) -> Signer<WithKeypair> {
+        pub fn from_private_key(private_key: Scalar, tweak: Option<Tweak>) -> Signer<WithKeypair> {
         Signer {
             state: WithKeypair {
                 signer_key: SignerKey { private_key, tweak },
@@ -196,7 +194,7 @@ impl Signer<Init> {
     }
 }
 
-struct WithKeypair {
+pub struct WithKeypair {
     signer_key: SignerKey,
 }
 
@@ -243,7 +241,7 @@ impl Signer<WithKeypair> {
     }
 }
 
-struct WithNonces {
+pub struct WithNonces {
     r1: NoncePair,
     r2: NoncePair,
     signer_key: SignerKey,
@@ -268,7 +266,7 @@ impl Signer<WithNonces> {
 }
 
 #[derive(Debug, Clone)]
-struct Context {
+pub struct Context {
     group_nonce_r1: ProjectivePoint,
     group_nonce_r2: ProjectivePoint,
     context: Vec<ContextItem>,
@@ -315,7 +313,7 @@ impl Context {
     }
 }
 
-struct WithContext {
+pub struct WithContext {
     r1: NoncePair,
     r2: NoncePair,
     context: Context,
@@ -392,8 +390,7 @@ impl Signer<WithContext> {
     }
 }
 
-#[allow(dead_code)]
-fn serialize_signature(group_nonce: &ProjectivePoint, s: &Scalar) -> [u8; 64] {
+pub fn serialize_signature(group_nonce: &ProjectivePoint, s: &Scalar) -> [u8; 64] {
     let mut out = [0u8; 64];
     out[..32].copy_from_slice(&group_nonce.to_affine().x());
     out[32..].copy_from_slice(&s.to_bytes());
@@ -413,72 +410,6 @@ pub fn verify(s: Scalar, group_nonce: ProjectivePoint, signer_list: &SignerList)
             })
             .sum::<ProjectivePoint>();
     gs == rhs
-}
-
-fn main() {
-    // TODO: this should be converted to a library and main should be a test
-    let mut coordinator = Coordinator::new();
-    let signers = vec![
-        Signer::new_keypair(None).generate_nonces(),
-        Signer::new_keypair(None).generate_nonces(),
-        Signer::new_keypair(None).generate_nonces(),
-    ];
-    let mut messages: Vec<Message> = Vec::new();
-    for i in 0..3 {
-        let digest = Sha256::digest(format!("cisa is cool {}", i));
-        let mut message = [0u8; 32];
-        message.copy_from_slice(&digest);
-        messages.push(message);
-    }
-    for (i, singer) in signers.iter().enumerate() {
-        coordinator.add_context_item(singer.context_item(messages[i].clone()));
-    }
-
-    let mut coordinator = coordinator.collect_nonces();
-
-    for (i, singer) in signers.into_iter().enumerate() {
-        let signature = singer
-            .with_context(coordinator.context())
-            .sign(&messages[i]);
-        coordinator.add_signature(signature);
-    }
-
-    let (signature, group_nonce) = coordinator.collect_signatures();
-    let res = verify(signature, group_nonce, &coordinator.context().signer_list());
-    assert!(res);
-
-    // Test with tweaks
-    let mut coordinator = Coordinator::new();
-    let signers = vec![
-        Signer::new_keypair(Some(Tweak {
-            value: Scalar::random(&mut OsRng),
-            is_xonly: true,
-        }))
-        .generate_nonces(),
-        Signer::new_keypair(Some(Tweak {
-            value: Scalar::random(&mut OsRng),
-            is_xonly: true,
-        }))
-        .generate_nonces(),
-        Signer::new_keypair(Some(Tweak {
-            value: Scalar::random(&mut OsRng),
-            is_xonly: true,
-        }))
-        .generate_nonces(),
-    ];
-    for (i, singer) in signers.iter().enumerate() {
-        coordinator.add_context_item(singer.context_item(messages[i].clone()));
-    }
-    let mut coordinator = coordinator.collect_nonces();
-    for (i, singer) in signers.into_iter().enumerate() {
-        let signature = singer
-            .with_context(coordinator.context())
-            .sign(&messages[i]);
-        coordinator.add_signature(signature);
-    }
-    let (signature, group_nonce) = coordinator.collect_signatures();
-    let res = verify(signature, group_nonce, &coordinator.context().signer_list());
-    assert!(res);
 }
 
 #[cfg(test)]
@@ -519,6 +450,81 @@ mod tests {
     const AGGREGATE_SIGNATURE: &str =
         "f00c224cc4e1bb038b1f35d71c28608510236327924d350d75520eb6295eb190\
          8a38b68c0a7b484bc4ac7330ae2f5e909bf25b53fa60131f7d6799d5017311d8";
+
+    fn demo_messages() -> Vec<Message> {
+        (0..3)
+            .map(|i| {
+                let digest = Sha256::digest(format!("cisa is cool {}", i));
+                let mut message = [0u8; 32];
+                message.copy_from_slice(&digest);
+                message
+            })
+            .collect()
+    }
+
+    #[test]
+    fn full_aggregation_round_trip() {
+
+        let mut coordinator = Coordinator::new();
+        let signers = vec![
+            Signer::new_keypair(None).generate_nonces(),
+            Signer::new_keypair(None).generate_nonces(),
+            Signer::new_keypair(None).generate_nonces(),
+        ];
+        let messages = demo_messages();
+        for (i, singer) in signers.iter().enumerate() {
+            coordinator.add_context_item(singer.context_item(messages[i].clone()));
+        }
+
+        let mut coordinator = coordinator.collect_nonces();
+
+        for (i, singer) in signers.into_iter().enumerate() {
+            let signature = singer
+                .with_context(coordinator.context())
+                .sign(&messages[i]);
+            coordinator.add_signature(signature);
+        }
+
+        let (signature, group_nonce) = coordinator.collect_signatures();
+        let res = verify(signature, group_nonce, &coordinator.context().signer_list());
+        assert!(res);
+    }
+
+    #[test]
+    fn full_aggregation_round_trip_with_tweaks() {
+        let messages = demo_messages();
+        let mut coordinator = Coordinator::new();
+        let signers = vec![
+            Signer::new_keypair(Some(Tweak {
+                value: Scalar::random(&mut OsRng),
+                is_xonly: true,
+            }))
+            .generate_nonces(),
+            Signer::new_keypair(Some(Tweak {
+                value: Scalar::random(&mut OsRng),
+                is_xonly: true,
+            }))
+            .generate_nonces(),
+            Signer::new_keypair(Some(Tweak {
+                value: Scalar::random(&mut OsRng),
+                is_xonly: true,
+            }))
+            .generate_nonces(),
+        ];
+        for (i, singer) in signers.iter().enumerate() {
+            coordinator.add_context_item(singer.context_item(messages[i].clone()));
+        }
+        let mut coordinator = coordinator.collect_nonces();
+        for (i, singer) in signers.into_iter().enumerate() {
+            let signature = singer
+                .with_context(coordinator.context())
+                .sign(&messages[i]);
+            coordinator.add_signature(signature);
+        }
+        let (signature, group_nonce) = coordinator.collect_signatures();
+        let res = verify(signature, group_nonce, &coordinator.context().signer_list());
+        assert!(res);
+    }
 
     fn hex(value: &str) -> Vec<u8> {
         let value: String = value.chars().filter(|c| !c.is_whitespace()).collect();

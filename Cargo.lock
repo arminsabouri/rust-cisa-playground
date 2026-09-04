@@ -24,6 +24,9 @@ dependencies = [
 [[package]]
 name = "bip460"
 version = "0.1.0"
+dependencies = [
+ "bip459",
+]
 
 [[package]]
 name = "block-buffer"
