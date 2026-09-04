@@ -6,7 +6,10 @@ use k256::{
     sha2::Digest,
 };
 
+use k256::EncodedPoint;
+use k256::elliptic_curve::PrimeField;
 use k256::elliptic_curve::point::AffineCoordinates;
+use k256::elliptic_curve::sec1::FromEncodedPoint;
 use k256::sha2::Sha256;
 
 const TAG_AUX: &[u8] = b"FullAgg/aux";
@@ -397,6 +400,46 @@ pub fn serialize_signature(group_nonce: &ProjectivePoint, s: &Scalar) -> [u8; 64
     out
 }
 
+fn lift_x_bytes(x: &[u8]) -> Option<ProjectivePoint> {
+    let mut compressed = [0u8; 33];
+    compressed[0] = 0x02;
+    compressed[1..].copy_from_slice(x.try_into().ok()?);
+    let encoded = EncodedPoint::from_bytes(compressed).ok()?;
+    Option::from(ProjectivePoint::from_encoded_point(&encoded))
+}
+
+fn scalar_from_bytes(bytes: &[u8]) -> Option<Scalar> {
+    let bytes: [u8; 32] = bytes.try_into().ok()?;
+    Option::from(Scalar::from_repr(bytes.into()))
+}
+
+/// Verifies a serialized aggregate signature against x-only public keys, as
+/// Verify is defined in BIP 459. Fails if a public key or the nonce is not on
+/// the curve, if s is not a valid scalar, or if the lists do not line up.
+pub fn verify_serialized(
+    pubkeys: &[[u8; 32]],
+    messages: &[Message],
+    signature: &[u8; 64],
+) -> bool {
+    if pubkeys.is_empty() || pubkeys.len() != messages.len() {
+        return false;
+    }
+    let Some(group_nonce) = lift_x_bytes(&signature[..32]) else {
+        return false;
+    };
+    let Some(s) = scalar_from_bytes(&signature[32..]) else {
+        return false;
+    };
+    let mut signer_list = SignerList::with_capacity(pubkeys.len());
+    for (pubkey, message) in pubkeys.iter().zip(messages) {
+        let Some(point) = lift_x_bytes(pubkey) else {
+            return false;
+        };
+        signer_list.push((point, *message));
+    }
+    verify(s, group_nonce, &signer_list)
+}
+
 /// Verifies the group signature and group nonce
 pub fn verify(s: Scalar, group_nonce: ProjectivePoint, signer_list: &SignerList) -> bool {
     let gs = ProjectivePoint::GENERATOR * s;
@@ -542,6 +585,37 @@ mod tests {
         let mut out = [0u8; 32];
         out.copy_from_slice(&hex(value));
         out
+    }
+
+    fn program(value: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&hex(value));
+        out
+    }
+
+    #[test]
+    fn verify_serialized_accepts_the_vector() {
+        let pubkeys: Vec<[u8; 32]> = WITNESS_PROGRAMS.iter().map(|p| program(p)).collect();
+        let messages: Vec<Message> = SIG_HASHES.iter().map(|m| message(m)).collect();
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&hex(AGGREGATE_SIGNATURE));
+
+        assert!(verify_serialized(&pubkeys, &messages, &signature));
+
+        // A flipped bit in s, a swapped signer order, and a truncated list are
+        // all rejected rather than panicking.
+        let mut tampered = signature;
+        tampered[63] ^= 1;
+        assert!(!verify_serialized(&pubkeys, &messages, &tampered));
+
+        let swapped = vec![pubkeys[1], pubkeys[0]];
+        assert!(!verify_serialized(&swapped, &messages, &signature));
+
+        assert!(!verify_serialized(&pubkeys[..1], &messages, &signature));
+        assert!(!verify_serialized(&[], &[], &signature));
+
+        // An x coordinate with no curve point is a verification failure.
+        assert!(!verify_serialized(&[[0xff; 32]], &messages[..1], &signature));
     }
 
     #[test]
