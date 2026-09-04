@@ -4,7 +4,7 @@ use bitcoin::hashes::{Hash, HashEngine};
 use bitcoin::sighash::{
     Annex, Prevouts, SigningDataError, SighashCache, TapSighash, TapSighashType, TaprootError,
 };
-use bitcoin::{Transaction, TxOut};
+use bitcoin::{Transaction, TxOut, Witness};
 
 // BIP 460 Pass 3 verifies a full-aggregation group with Verify as defined in
 // BIP 459, over the group's ordered public key and message lists.
@@ -67,11 +67,159 @@ pub fn aggregated_sighash<Tx: Borrow<Transaction>, T: Borrow<TxOut>>(
     Ok(TapSighash::from_engine(engine))
 }
 
+pub const ANNEX_PREFIX: u8 = 0x50;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseError {
+    EmptyWitness,
+    NotKeyPath,
+    UndefinedStructure(usize),
+    ExplicitSighashDefault,
+    UndefinedSighashType(u8),
+}
+
+// The valid witness element forms of BIP 460. A half-aggregation final carries
+// its nonce share followed by the group's s value, a full-aggregation final
+// carries the 64 byte aggregate signature, so both are 64 bytes of signature
+// data and Pass 3 splits them according to the mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WitnessElement<'a> {
+    OptedOut {
+        signature: &'a [u8; 64],
+        hash_type: TapSighashType,
+    },
+    HalfAggMember {
+        nonce_share: &'a [u8; 32],
+        hash_type: TapSighashType,
+    },
+    FullAggMember {
+        hash_type: TapSighashType,
+    },
+    Final {
+        mode: AggMode,
+        data: &'a [u8; 64],
+        hash_type: TapSighashType,
+    },
+}
+
+impl WitnessElement<'_> {
+    pub fn hash_type(&self) -> TapSighashType {
+        match self {
+            WitnessElement::OptedOut { hash_type, .. }
+            | WitnessElement::HalfAggMember { hash_type, .. }
+            | WitnessElement::FullAggMember { hash_type }
+            | WitnessElement::Final { hash_type, .. } => *hash_type,
+        }
+    }
+
+    pub fn mode(&self) -> Option<AggMode> {
+        match self {
+            WitnessElement::OptedOut { .. } => None,
+            WitnessElement::HalfAggMember { .. } => Some(AggMode::Half),
+            WitnessElement::FullAggMember { .. } => Some(AggMode::Full),
+            WitnessElement::Final { mode, .. } => Some(*mode),
+        }
+    }
+}
+
+// SIGHASH_DEFAULT is only expressible by omitting the sighash byte, so that
+// every signature message has exactly one witness encoding.
+fn parse_hash_type(byte: Option<u8>) -> Result<TapSighashType, ParseError> {
+    match byte {
+        None => Ok(TapSighashType::Default),
+        Some(0x00) => Err(ParseError::ExplicitSighashDefault),
+        Some(byte) => match byte {
+            0x01..=0x03 | 0x81..=0x83 => Ok(TapSighashType::from_consensus_u8(byte)
+                .expect("checked against the valid sighash types")),
+            _ => Err(ParseError::UndefinedSighashType(byte)),
+        },
+    }
+}
+
+fn array<const N: usize>(bytes: &[u8]) -> &[u8; N] {
+    bytes.try_into().expect("length checked by the caller")
+}
+
+pub fn parse_witness_element(element: &[u8]) -> Result<WitnessElement<'_>, ParseError> {
+    match element.len() {
+        // A 64 byte element is always opted out, even when its last byte
+        // happens to equal a marker value.
+        64 => Ok(WitnessElement::OptedOut {
+            signature: array(element),
+            hash_type: TapSighashType::Default,
+        }),
+        // Only 65 and 66 byte elements are interpreted against the marker.
+        65 => match AggMode::from_byte(element[64]) {
+            None => Ok(WitnessElement::OptedOut {
+                signature: array(&element[..64]),
+                hash_type: parse_hash_type(Some(element[64]))?,
+            }),
+            Some(mode) => Ok(WitnessElement::Final {
+                mode,
+                data: array(&element[..64]),
+                hash_type: TapSighashType::Default,
+            }),
+        },
+        66 => {
+            let mode = AggMode::from_byte(element[65]).ok_or(ParseError::UndefinedStructure(66))?;
+            Ok(WitnessElement::Final {
+                mode,
+                data: array(&element[..64]),
+                hash_type: parse_hash_type(Some(element[64]))?,
+            })
+        }
+        0 => Ok(WitnessElement::FullAggMember {
+            hash_type: TapSighashType::Default,
+        }),
+        // In the 1 and 33 byte forms the last byte is a sighash byte, so an
+        // element of those lengths ending in a marker value is a member with an
+        // invalid sighash type.
+        1 => Ok(WitnessElement::FullAggMember {
+            hash_type: parse_hash_type(Some(element[0]))?,
+        }),
+        32 => Ok(WitnessElement::HalfAggMember {
+            nonce_share: array(element),
+            hash_type: TapSighashType::Default,
+        }),
+        33 => Ok(WitnessElement::HalfAggMember {
+            nonce_share: array(&element[..32]),
+            hash_type: parse_hash_type(Some(element[32]))?,
+        }),
+        length => Err(ParseError::UndefinedStructure(length)),
+    }
+}
+
+pub fn split_annex(witness: &Witness) -> Result<(&[u8], Option<&[u8]>), ParseError> {
+    let length = witness.len();
+    if length == 0 {
+        return Err(ParseError::EmptyWitness);
+    }
+    let last = witness.last().expect("witness is not empty");
+    // A single element is never an annex.
+    let (spend_length, annex) = if length >= 2 && last.first() == Some(&ANNEX_PREFIX) {
+        (length - 1, Some(last))
+    } else {
+        (length, None)
+    };
+    if spend_length != 1 {
+        return Err(ParseError::NotKeyPath);
+    }
+    Ok((witness.nth(0).expect("witness is not empty"), annex))
+}
+
+pub fn parse_key_path_witness(
+    witness: &Witness,
+) -> Result<(WitnessElement<'_>, Option<&[u8]>), ParseError> {
+    let (element, annex) = split_annex(witness)?;
+    Ok((parse_witness_element(element)?, annex))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bitcoin::consensus::deserialize;
     use bitcoin::{Amount, ScriptBuf};
+    use bitcoin::Witness;
 
     // keyPathSpending from bip-0460/wallet-test-vectors.json in
     // https://github.com/bitcoin/bips/pull/2212
@@ -93,6 +241,170 @@ mod tests {
                 script_pubkey: ScriptBuf::from_hex(script_pubkey).unwrap(),
             })
             .collect()
+    }
+
+    fn bytes(length: usize, last: Option<u8>) -> Vec<u8> {
+        let mut out = vec![0x11u8; length];
+        if let Some(byte) = last {
+            *out.last_mut().expect("non-empty") = byte;
+        }
+        out
+    }
+
+    #[test]
+    fn opted_out_forms() {
+        let sig = bytes(64, None);
+        assert_eq!(
+            parse_witness_element(&sig).unwrap(),
+            WitnessElement::OptedOut {
+                signature: array(&sig),
+                hash_type: TapSighashType::Default
+            }
+        );
+
+        let explicit = bytes(65, Some(0x83));
+        assert_eq!(
+            parse_witness_element(&explicit).unwrap(),
+            WitnessElement::OptedOut {
+                signature: array(&explicit[..64]),
+                hash_type: TapSighashType::SinglePlusAnyoneCanPay
+            }
+        );
+
+        // A 64 byte element is opted out even when its last byte is a marker.
+        let lookalike = bytes(64, Some(HALF_AGG_MARKER));
+        assert_eq!(
+            parse_witness_element(&lookalike).unwrap().mode(),
+            None
+        );
+    }
+
+    #[test]
+    fn member_forms() {
+        assert_eq!(
+            parse_witness_element(&bytes(0, None)).unwrap(),
+            WitnessElement::FullAggMember {
+                hash_type: TapSighashType::Default
+            }
+        );
+        assert_eq!(
+            parse_witness_element(&bytes(1, Some(0x01))).unwrap(),
+            WitnessElement::FullAggMember {
+                hash_type: TapSighashType::All
+            }
+        );
+
+        let share = bytes(32, None);
+        assert_eq!(
+            parse_witness_element(&share).unwrap(),
+            WitnessElement::HalfAggMember {
+                nonce_share: array(&share),
+                hash_type: TapSighashType::Default
+            }
+        );
+
+        let with_sighash = bytes(33, Some(0x03));
+        assert_eq!(
+            parse_witness_element(&with_sighash).unwrap(),
+            WitnessElement::HalfAggMember {
+                nonce_share: array(&with_sighash[..32]),
+                hash_type: TapSighashType::Single
+            }
+        );
+    }
+
+    #[test]
+    fn final_forms() {
+        for (marker, mode) in [(HALF_AGG_MARKER, AggMode::Half), (FULL_AGG_MARKER, AggMode::Full)] {
+            let default = bytes(65, Some(marker));
+            assert_eq!(
+                parse_witness_element(&default).unwrap(),
+                WitnessElement::Final {
+                    mode,
+                    data: array(&default[..64]),
+                    hash_type: TapSighashType::Default
+                }
+            );
+
+            let mut explicit = bytes(66, Some(marker));
+            explicit[64] = 0x02;
+            assert_eq!(
+                parse_witness_element(&explicit).unwrap(),
+                WitnessElement::Final {
+                    mode,
+                    data: array(&explicit[..64]),
+                    hash_type: TapSighashType::None
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_forms() {
+        let mut explicit_default_final = bytes(66, Some(HALF_AGG_MARKER));
+        explicit_default_final[64] = 0x00;
+
+        for (element, expected) in [
+            // 65 bytes not ending in a marker is an opted-out signature, so an
+            // undefined marker value is read as an undefined sighash byte.
+            (bytes(65, Some(0xbb)), ParseError::UndefinedSighashType(0xbb)),
+            (bytes(65, Some(0x04)), ParseError::UndefinedSighashType(0x04)),
+            // The last byte of the 1 and 33 byte forms is a sighash byte.
+            (bytes(1, Some(HALF_AGG_MARKER)), ParseError::UndefinedSighashType(HALF_AGG_MARKER)),
+            (bytes(33, Some(HALF_AGG_MARKER)), ParseError::UndefinedSighashType(HALF_AGG_MARKER)),
+            // SIGHASH_DEFAULT is only expressible by omitting the byte.
+            (bytes(65, Some(0x00)), ParseError::ExplicitSighashDefault),
+            (bytes(1, Some(0x00)), ParseError::ExplicitSighashDefault),
+            (bytes(33, Some(0x00)), ParseError::ExplicitSighashDefault),
+            (explicit_default_final, ParseError::ExplicitSighashDefault),
+            // Lengths and marker combinations that match no row of the table.
+            (bytes(2, Some(HALF_AGG_MARKER)), ParseError::UndefinedStructure(2)),
+            (bytes(66, Some(0x01)), ParseError::UndefinedStructure(66)),
+            (bytes(97, Some(HALF_AGG_MARKER)), ParseError::UndefinedStructure(97)),
+            (bytes(67, Some(FULL_AGG_MARKER)), ParseError::UndefinedStructure(67)),
+        ] {
+            let length = element.len();
+            assert_eq!(
+                parse_witness_element(&element).unwrap_err(),
+                expected,
+                "element of length {}",
+                length
+            );
+        }
+    }
+
+    #[test]
+    fn annex_handling() {
+        let annex = vec![ANNEX_PREFIX, 0x01, 0x02];
+
+        let with_annex = Witness::from_slice(&[bytes(64, None), annex.clone()]);
+        let (element, found) = parse_key_path_witness(&with_annex).unwrap();
+        assert_eq!(element.mode(), None);
+        assert_eq!(found, Some(&annex[..]));
+
+        let without_annex = Witness::from_slice(&[bytes(32, None)]);
+        let (element, found) = parse_key_path_witness(&without_annex).unwrap();
+        assert_eq!(element.mode(), Some(AggMode::Half));
+        assert_eq!(found, None);
+
+        assert_eq!(
+            parse_key_path_witness(&Witness::default()).unwrap_err(),
+            ParseError::EmptyWitness
+        );
+
+        // A single element is never an annex, so this is parsed as a spend.
+        let lone_annex = Witness::from_slice(&[annex.clone()]);
+        assert_eq!(
+            parse_key_path_witness(&lone_annex).unwrap_err(),
+            ParseError::UndefinedStructure(3)
+        );
+
+        // Two non-annex elements make this a script path spend.
+        let script_path = Witness::from_slice(&[bytes(64, None), bytes(34, None)]);
+        assert_eq!(
+            parse_key_path_witness(&script_path).unwrap_err(),
+            ParseError::NotKeyPath
+        );
     }
 
     #[test]
