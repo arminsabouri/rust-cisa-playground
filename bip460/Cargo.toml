@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 bip459 = { path = "../bip459" }
+bitcoin = "0.32"
