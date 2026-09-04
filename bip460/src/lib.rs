@@ -214,6 +214,69 @@ pub fn parse_key_path_witness(
     Ok((parse_witness_element(element)?, annex))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupError {
+    MembersWithoutFinal(AggMode),
+    MultipleFinals(AggMode),
+    MemberAfterFinal(AggMode),
+}
+
+// The inputs of one aggregation group in input order, with the input carrying
+// the group's marker last. A group may consist of its final input alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AggregationGroup {
+    pub mode: AggMode,
+    pub inputs: Vec<usize>,
+}
+
+// Takes the parsed witness v2 key path spends of a transaction, indexed by
+// input index, with None for inputs validated under their own rules. A
+// transaction carries at most one group per mode, so opted-out inputs, script
+// path spends and other output types can be mixed in freely.
+pub fn aggregation_groups(
+    inputs: &[Option<WitnessElement<'_>>],
+) -> Result<Vec<AggregationGroup>, GroupError> {
+    let mut groups = Vec::new();
+    for mode in [AggMode::Half, AggMode::Full] {
+        let mut members = Vec::new();
+        let mut final_input = None;
+
+        for (index, element) in inputs.iter().enumerate() {
+            let Some(element) = element else { continue };
+            if element.mode() != Some(mode) {
+                continue;
+            }
+            match element {
+                WitnessElement::Final { .. } => {
+                    if final_input.is_some() {
+                        return Err(GroupError::MultipleFinals(mode));
+                    }
+                    final_input = Some(index);
+                }
+                _ => {
+                    if final_input.is_some() {
+                        return Err(GroupError::MemberAfterFinal(mode));
+                    }
+                    members.push(index);
+                }
+            }
+        }
+
+        match final_input {
+            Some(index) => {
+                members.push(index);
+                groups.push(AggregationGroup {
+                    mode,
+                    inputs: members,
+                });
+            }
+            None if !members.is_empty() => return Err(GroupError::MembersWithoutFinal(mode)),
+            None => {}
+        }
+    }
+    Ok(groups)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,6 +467,115 @@ mod tests {
         assert_eq!(
             parse_key_path_witness(&script_path).unwrap_err(),
             ParseError::NotKeyPath
+        );
+    }
+
+    fn opted_out() -> WitnessElement<'static> {
+        WitnessElement::OptedOut {
+            signature: &[0; 64],
+            hash_type: TapSighashType::Default,
+        }
+    }
+
+    fn member(mode: AggMode) -> WitnessElement<'static> {
+        match mode {
+            AggMode::Half => WitnessElement::HalfAggMember {
+                nonce_share: &[0; 32],
+                hash_type: TapSighashType::Default,
+            },
+            AggMode::Full => WitnessElement::FullAggMember {
+                hash_type: TapSighashType::Default,
+            },
+        }
+    }
+
+    fn group_final(mode: AggMode) -> WitnessElement<'static> {
+        WitnessElement::Final {
+            mode,
+            data: &[0; 64],
+            hash_type: TapSighashType::Default,
+        }
+    }
+
+    #[test]
+    fn mixed_transaction_groups() {
+        // Example 4 of the BIP: two opted-out inputs, a half-aggregation group
+        // and a full-aggregation group, with a non witness v2 input mixed in.
+        let inputs = [
+            Some(opted_out()),
+            Some(member(AggMode::Half)),
+            Some(member(AggMode::Full)),
+            None,
+            Some(member(AggMode::Full)),
+            Some(group_final(AggMode::Half)),
+            Some(opted_out()),
+            Some(group_final(AggMode::Full)),
+        ];
+        assert_eq!(
+            aggregation_groups(&inputs).unwrap(),
+            vec![
+                AggregationGroup {
+                    mode: AggMode::Half,
+                    inputs: vec![1, 5]
+                },
+                AggregationGroup {
+                    mode: AggMode::Full,
+                    inputs: vec![2, 4, 7]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_group_may_be_its_final_input_alone() {
+        for mode in [AggMode::Half, AggMode::Full] {
+            let inputs = [Some(opted_out()), Some(group_final(mode))];
+            assert_eq!(
+                aggregation_groups(&inputs).unwrap(),
+                vec![AggregationGroup {
+                    mode,
+                    inputs: vec![1]
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn opted_out_inputs_do_not_form_groups() {
+        let inputs = [Some(opted_out()), None, Some(opted_out())];
+        assert!(aggregation_groups(&inputs).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejected_group_structures() {
+        for mode in [AggMode::Half, AggMode::Full] {
+            assert_eq!(
+                aggregation_groups(&[Some(member(mode)), Some(member(mode))]).unwrap_err(),
+                GroupError::MembersWithoutFinal(mode)
+            );
+            assert_eq!(
+                aggregation_groups(&[Some(group_final(mode)), Some(member(mode))]).unwrap_err(),
+                GroupError::MemberAfterFinal(mode)
+            );
+            assert_eq!(
+                aggregation_groups(&[Some(group_final(mode)), Some(group_final(mode))]).unwrap_err(),
+                GroupError::MultipleFinals(mode)
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_groups_are_independent() {
+        // A complete half-aggregation group does not rescue full-aggregation
+        // members that have no final input of their own.
+        let inputs = [
+            Some(member(AggMode::Half)),
+            Some(group_final(AggMode::Half)),
+            Some(member(AggMode::Full)),
+        ];
+        assert_eq!(
+            aggregation_groups(&inputs).unwrap_err(),
+            GroupError::MembersWithoutFinal(AggMode::Full)
         );
     }
 
