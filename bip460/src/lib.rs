@@ -436,7 +436,10 @@ pub fn verify_key_path_spends(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::consensus::deserialize;
+    use bip459::{Coordinator, Signer, Tweak, serialize_signature};
+    use bitcoin::consensus::{deserialize, serialize};
+    use k256::Scalar;
+    use k256::elliptic_curve::PrimeField;
     use bitcoin::{Amount, ScriptBuf};
     use bitcoin::Witness;
 
@@ -848,6 +851,124 @@ mod tests {
             .encode(),
             expected
         );
+    }
+
+    const FULL_AGG_UNSIGNED_TX: &str = "020000000254d36a0897340110cc34b526d73b206175ae4f5db4d25fe7bdeef3a8a5e89afd0100000000ffffffff835a02826d69e61b563ec713020bd2b7c3bc3848223cda2b3c52bbdcd3e6267a0100000000ffffffff01c0cb1707000000002252208640c68f13b51a1e63dfc5cc41202cca21c18f1f9d7037c2cbec3f03f63e52e400000000";
+    const INTERNAL_PRIVKEYS: [&str; 2] = [
+        "edc07892ebcc0812db6aea0fbc967eed825fedecf70db83d4c69fbe574b97361",
+        "80f4d8f499868a546ca66497352d4df0aa1c7e99cd83faeba3eeb11ecafec708",
+    ];
+    const TAP_TWEAKS: [&str; 2] = [
+        "22b1442d7532c6cdbe4d9854a90b8f7a5820c559af2ca6f7d375e6fc3bfd8a09",
+        "85fb96a1a8a6c3a93ebfaf308aecc9837eceb6cfda6eb735cf8586e989a87563",
+    ];
+    const TWEAKED_PRIVKEYS: [&str; 2] = [
+        "1071bcc060fecee099b8826465a20e691fd1d65ff6f1bef9600d8454e080bc29",
+        "0506bdad0f203954d2194a9955bf7b92d4b238360ceabc4a2b96d5cabea9ae5b",
+    ];
+    const SECNONCES: [&str; 2] = [
+        "87c33dcedc7db5994d68278a81a4693ee961d08ef7e3fdeab611ab8061e92dd4517ac39af981926ed1124224dfe721c6dc0769a8ea24d2e2fc2636c3b1e9ca15",
+        "3c4b7832dd37bbdb955ebf900769d133d55161e5c6ad9e09c2efa4ace1ba2e153d007745e9f74e6b8a47651a672111b07589261401674263a40e286340bcefea",
+    ];
+
+    fn scalar(value: &str) -> Scalar {
+        let bytes: [u8; 32] = hex(value).try_into().unwrap();
+        Scalar::from_repr(bytes.into()).unwrap()
+    }
+
+    fn secnonce(value: &str) -> (Scalar, Scalar) {
+        (scalar(&value[..64]), scalar(&value[64..]))
+    }
+
+    // Drives a BIP 459 signing session to the serialized 64 byte aggregate.
+    fn sign_full_agg(
+        keys: &[(Scalar, Option<Tweak>)],
+        nonces: &[(Scalar, Scalar)],
+        messages: &[Message],
+    ) -> [u8; 64] {
+        let signers: Vec<_> = keys
+            .iter()
+            .zip(nonces)
+            .map(|((private_key, tweak), (r1, r2))| {
+                Signer::from_private_key(*private_key, *tweak).with_nonces(*r1, *r2)
+            })
+            .collect();
+
+        let mut coordinator = Coordinator::new();
+        for (index, signer) in signers.iter().enumerate() {
+            coordinator.add_context_item(signer.context_item(messages[index]));
+        }
+        let mut coordinator = coordinator.collect_nonces();
+        for (index, signer) in signers.into_iter().enumerate() {
+            let partial = signer.with_context(coordinator.context()).sign(&messages[index]);
+            coordinator.add_signature(partial);
+        }
+        let (s, group_nonce) = coordinator.collect_signatures();
+        serialize_signature(&group_nonce, &s)
+    }
+
+    fn full_agg_messages(transaction: &Transaction, spent: &[TxOut]) -> Vec<Message> {
+        let prevouts = Prevouts::All(spent);
+        let mut cache = SighashCache::new(transaction);
+        (0..2)
+            .map(|index| {
+                aggregated_sighash(
+                    &mut cache,
+                    index,
+                    &prevouts,
+                    None,
+                    TapSighashType::All,
+                    AggMode::Full,
+                )
+                .unwrap()
+                .to_byte_array()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn signing_reproduces_the_vector_transaction() {
+        let unsigned: Transaction = deserialize(&hex(FULL_AGG_UNSIGNED_TX)).unwrap();
+        let spent = full_agg_spent_outputs();
+        let messages = full_agg_messages(&unsigned, &spent);
+        let nonces: Vec<(Scalar, Scalar)> = SECNONCES.iter().map(|n| secnonce(n)).collect();
+
+        let tweaked: Vec<(Scalar, Option<Tweak>)> = TWEAKED_PRIVKEYS
+            .iter()
+            .map(|key| (scalar(key), None))
+            .collect();
+        let signature = sign_full_agg(&tweaked, &nonces, &messages);
+
+        // The same signature must come out of the untweaked keys carrying their
+        // taproot tweaks, which is what BIP 459 key tweaking is for.
+        let internal: Vec<(Scalar, Option<Tweak>)> = INTERNAL_PRIVKEYS
+            .iter()
+            .zip(TAP_TWEAKS)
+            .map(|(key, tweak)| {
+                (
+                    scalar(key),
+                    Some(Tweak {
+                        value: scalar(tweak),
+                        is_xonly: true,
+                    }),
+                )
+            })
+            .collect();
+        assert_eq!(sign_full_agg(&internal, &nonces, &messages), signature);
+
+        let mut signed = unsigned.clone();
+        signed.input[0].witness = Witness::from_slice(&[WitnessElement::FullAggMember {
+            hash_type: TapSighashType::All,
+        }
+        .encode()]);
+        signed.input[1].witness = Witness::from_slice(&[WitnessElement::Final {
+            mode: AggMode::Full,
+            data: &signature,
+            hash_type: TapSighashType::All,
+        }
+        .encode()]);
+
+        assert_eq!(serialize(&signed), hex(FULL_AGG_SIGNED_TX));
     }
 
     #[test]

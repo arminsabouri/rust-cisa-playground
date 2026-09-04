@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 bip459 = { path = "../bip459" }
 bitcoin = "0.32"
+
+[dev-dependencies]
+k256 = { version = "0.13.4", features = ["arithmetic"] }
