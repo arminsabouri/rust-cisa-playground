@@ -251,6 +251,11 @@ pub struct WithNonces {
 }
 
 impl Signer<WithNonces> {
+    /// The public key this signer signs under, after any tweak.
+    pub fn public_key(&self) -> PublicKey {
+        self.signer_key.public_key()
+    }
+
     /// The public nonces this signer must publish before the context is built.
     pub fn public_nonces(&self) -> (ProjectivePoint, ProjectivePoint) {
         (self.r1.1, self.r2.1)
@@ -423,6 +428,13 @@ pub fn parse_point(bytes: &[u8; 33]) -> Option<ProjectivePoint> {
 /// Serializes a point SEC1 compressed.
 pub fn serialize_point(point: &ProjectivePoint) -> [u8; 33] {
     cbytes(point)
+}
+
+/// Serializes a point x-only, as public keys appear in BIP 340.
+pub fn serialize_xonly(point: &ProjectivePoint) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&point.to_affine().x());
+    out
 }
 
 fn scalar_from_bytes(bytes: &[u8]) -> Option<Scalar> {
