@@ -250,18 +250,17 @@ struct WithNonces {
 }
 
 impl Signer<WithNonces> {
-    // TODO: message should be part of the WithNonces state, NOT a parameter. that can lead to nonce reuse for different messages
     pub fn context_item(&self, message: Message) -> ContextItem {
         (self.signer_key.public_key(), message, self.r1.1, self.r2.1)
     }
 
     /// Signer adds the context to their state and can now sign
-    pub fn with_context(&self, context: Context) -> Signer<WithContext> {
+    pub fn with_context(self, context: Context) -> Signer<WithContext> {
         Signer {
             state: WithContext {
-                r1: self.r1,
-                r2: self.r2,
-                signer_key: self.signer_key.clone(),
+                r1: self.state.r1,
+                r2: self.state.r2,
+                signer_key: self.state.signer_key,
                 context,
             },
         }
@@ -355,7 +354,7 @@ fn partial_sig_verify(context: &Context, psig: Scalar, index: usize) -> bool {
 
 impl Signer<WithContext> {
     /// Signer signs the message and returns their partial signature
-    pub fn sign(&self, message: &Message) -> Scalar {
+    pub fn sign(self, message: &Message) -> Scalar {
         let mut counter = 0;
         let mut index = None;
         for (i, (_, _, _, r2)) in self.context.context.iter().enumerate() {
@@ -437,7 +436,7 @@ fn main() {
 
     let mut coordinator = coordinator.collect_nonces();
 
-    for (i, singer) in signers.iter().enumerate() {
+    for (i, singer) in signers.into_iter().enumerate() {
         let signature = singer
             .with_context(coordinator.context())
             .sign(&messages[i]);
@@ -471,7 +470,7 @@ fn main() {
         coordinator.add_context_item(singer.context_item(messages[i].clone()));
     }
     let mut coordinator = coordinator.collect_nonces();
-    for (i, singer) in signers.iter().enumerate() {
+    for (i, singer) in signers.into_iter().enumerate() {
         let signature = singer
             .with_context(coordinator.context())
             .sign(&messages[i]);
@@ -565,7 +564,7 @@ mod tests {
             coordinator.add_context_item(signer.context_item(messages[i]));
         }
         let mut coordinator = coordinator.collect_nonces();
-        for (i, signer) in signers.iter().enumerate() {
+        for (i, signer) in signers.into_iter().enumerate() {
             let signature = signer.with_context(coordinator.context()).sign(&messages[i]);
             coordinator.add_signature(signature);
         }
