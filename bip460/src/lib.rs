@@ -4,11 +4,13 @@ use bitcoin::hashes::{Hash, HashEngine};
 use bitcoin::sighash::{
     Annex, Prevouts, SigningDataError, SighashCache, TapSighash, TapSighashType, TaprootError,
 };
-use bitcoin::{Transaction, TxOut, Witness};
+use bitcoin::secp256k1::schnorr::Signature as SchnorrSignature;
+use bitcoin::secp256k1::{Message as SecpMessage, Secp256k1, XOnlyPublicKey};
+use bitcoin::{Script, Transaction, TxOut, Witness};
 
 // BIP 460 Pass 3 verifies a full-aggregation group with Verify as defined in
 // BIP 459, over the group's ordered public key and message lists.
-pub use bip459::{Message, PublicKey, verify as verify_full_agg};
+pub use bip459::{Message, verify_serialized as verify_full_agg};
 
 // Marker bytes and sighash epoch defined by BIP 460. The marker is the last
 // byte of the witness element of the final input of an aggregation group.
@@ -275,6 +277,117 @@ pub fn aggregation_groups(
         }
     }
     Ok(groups)
+}
+
+// Witness version 2 outputs have a scriptPubKey of OP_2 <32-byte program>.
+pub const WITNESS_V2_PREFIX: [u8; 2] = [0x52, 0x20];
+
+pub fn witness_v2_program(script_pubkey: &Script) -> Option<[u8; 32]> {
+    let bytes = script_pubkey.as_bytes();
+    if bytes.len() != 34 || bytes[..2] != WITNESS_V2_PREFIX {
+        return None;
+    }
+    Some(bytes[2..].try_into().expect("length checked above"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyError {
+    Parse(usize, ParseError),
+    Group(GroupError),
+    Sighash(usize),
+    OptedOutSignatureInvalid(usize),
+    GroupSignatureInvalid(AggMode),
+    HalfAggregationUnsupported,
+}
+
+// Pass 3. Opted-out inputs are verified individually against the unchanged BIP
+// 341 message, and each aggregation group is verified once over its inputs'
+// public keys and messages ordered by input index.
+pub fn verify_key_path_spends(
+    transaction: &Transaction,
+    spent_outputs: &[TxOut],
+) -> Result<(), VerifyError> {
+    let prevouts = Prevouts::All(spent_outputs);
+    let mut cache = SighashCache::new(transaction);
+
+    let mut spends = Vec::new();
+    for (index, input) in transaction.input.iter().enumerate() {
+        let Some(program) = witness_v2_program(&spent_outputs[index].script_pubkey) else {
+            continue;
+        };
+        let (element, annex) = parse_key_path_witness(&input.witness)
+            .map_err(|error| VerifyError::Parse(index, error))?;
+        spends.push((index, element, annex, program));
+    }
+
+    let classified: Vec<(usize, WitnessElement<'_>)> = spends
+        .iter()
+        .map(|(index, element, _, _)| (*index, *element))
+        .collect();
+    let groups = aggregation_groups(&classified).map_err(VerifyError::Group)?;
+
+    let secp = Secp256k1::verification_only();
+    for (index, element, annex, program) in &spends {
+        let WitnessElement::OptedOut { signature, hash_type } = element else {
+            continue;
+        };
+        let message = cache
+            .taproot_signature_hash(
+                *index,
+                &prevouts,
+                annex.map(|bytes| Annex::new(bytes).expect("checked by split_annex")),
+                None,
+                *hash_type,
+            )
+            .map_err(|_| VerifyError::Sighash(*index))?;
+        let pubkey = XOnlyPublicKey::from_slice(program)
+            .map_err(|_| VerifyError::OptedOutSignatureInvalid(*index))?;
+        let signature = SchnorrSignature::from_slice(*signature)
+            .map_err(|_| VerifyError::OptedOutSignatureInvalid(*index))?;
+        secp.verify_schnorr(
+            &signature,
+            &SecpMessage::from_digest(message.to_byte_array()),
+            &pubkey,
+        )
+        .map_err(|_| VerifyError::OptedOutSignatureInvalid(*index))?;
+    }
+
+    for group in &groups {
+        if group.mode == AggMode::Half {
+            return Err(VerifyError::HalfAggregationUnsupported);
+        }
+        let mut pubkeys = Vec::with_capacity(group.inputs.len());
+        let mut messages = Vec::with_capacity(group.inputs.len());
+        let mut signature = None;
+
+        for input_index in &group.inputs {
+            let (index, element, annex, program) = spends
+                .iter()
+                .find(|(index, ..)| index == input_index)
+                .expect("group inputs come from spends");
+            let message = aggregated_sighash(
+                &mut cache,
+                *index,
+                &prevouts,
+                annex.map(|bytes| Annex::new(bytes).expect("checked by split_annex")),
+                element.hash_type(),
+                group.mode,
+            )
+            .map_err(|_| VerifyError::Sighash(*index))?;
+            pubkeys.push(*program);
+            messages.push(message.to_byte_array());
+            if let WitnessElement::Final { data, .. } = element {
+                signature = Some(*data);
+            }
+        }
+
+        let signature = signature.expect("a group always has a final input");
+        if !verify_full_agg(&pubkeys, &messages, signature) {
+            return Err(VerifyError::GroupSignatureInvalid(group.mode));
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -598,6 +711,34 @@ mod tests {
         assert_eq!(
             aggregation_groups(&scrambled).unwrap()[0].inputs,
             vec![1, 2, 3]
+        );
+    }
+
+    const FULL_AGG_SIGNED_TX: &str = "0200000000010254d36a0897340110cc34b526d73b206175ae4f5db4d25fe7bdeef3a8a5e89afd0100000000ffffffff835a02826d69e61b563ec713020bd2b7c3bc3848223cda2b3c52bbdcd3e6267a0100000000ffffffff01c0cb1707000000002252208640c68f13b51a1e63dfc5cc41202cca21c18f1f9d7037c2cbec3f03f63e52e40101010142f00c224cc4e1bb038b1f35d71c28608510236327924d350d75520eb6295eb1908a38b68c0a7b484bc4ac7330ae2f5e909bf25b53fa60131f7d6799d5017311d801bd00000000";
+
+    fn full_agg_spent_outputs() -> Vec<TxOut> {
+        spent_outputs(&[
+            ("52208640c68f13b51a1e63dfc5cc41202cca21c18f1f9d7037c2cbec3f03f63e52e4", 50000000),
+            ("522018b6491469cc78b764b01669b0a5a4e892f57e8c1b20b89bc1ca6dce3e881b51", 70000000),
+        ])
+    }
+
+    #[test]
+    fn full_aggregation_transaction_verifies() {
+        let transaction: Transaction = deserialize(&hex(FULL_AGG_SIGNED_TX)).unwrap();
+        verify_key_path_spends(&transaction, &full_agg_spent_outputs()).unwrap();
+    }
+
+    #[test]
+    fn a_tampered_aggregate_signature_is_rejected() {
+        let mut raw = hex(FULL_AGG_SIGNED_TX);
+        // Flip a bit in the aggregate signature carried by the final input.
+        let offset = raw.len() - 8;
+        raw[offset] ^= 1;
+        let transaction: Transaction = deserialize(&raw).unwrap();
+        assert_eq!(
+            verify_key_path_spends(&transaction, &full_agg_spent_outputs()),
+            Err(VerifyError::GroupSignatureInvalid(AggMode::Full))
         );
     }
 
