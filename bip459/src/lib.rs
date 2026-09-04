@@ -350,7 +350,8 @@ fn challenge(
     hasher_to_scalar(hasher)
 }
 
-fn partial_sig_verify(context: &Context, psig: Scalar, index: usize) -> bool {
+/// Verifies one signer's share, so a coordinator can attribute a failure.
+pub fn partial_sig_verify(context: &Context, psig: Scalar, index: usize) -> bool {
     let (pk, message, r1, r2) = &context.context[index];
     let group_nonce = context.group_nonce();
     let e = if has_even_y(&group_nonce) {

@@ -1,3 +1,6 @@
+mod signer;
+pub use signer::*;
+
 use std::borrow::Borrow;
 
 use bitcoin::hashes::{Hash, HashEngine};
@@ -436,7 +439,7 @@ pub fn verify_key_path_spends(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bip459::{Coordinator, Signer, Tweak, serialize_signature};
+    use bip459::{Coordinator as AggCoordinator, Signer, Tweak, serialize_signature};
     use bitcoin::consensus::{deserialize, serialize};
     use k256::Scalar;
     use k256::elliptic_curve::PrimeField;
@@ -894,7 +897,7 @@ mod tests {
             })
             .collect();
 
-        let mut coordinator = Coordinator::new();
+        let mut coordinator = AggCoordinator::new();
         for (index, signer) in signers.iter().enumerate() {
             coordinator.add_context_item(signer.context_item(messages[index]));
         }
@@ -969,6 +972,124 @@ mod tests {
         .encode()]);
 
         assert_eq!(serialize(&signed), hex(FULL_AGG_SIGNED_TX));
+    }
+
+    fn vector_session() -> (Transaction, Vec<TxOut>, Vec<SessionInput<'static>>) {
+        let unsigned: Transaction = deserialize(&hex(FULL_AGG_UNSIGNED_TX)).unwrap();
+        let inputs = (0..2)
+            .map(|index| SessionInput {
+                index,
+                hash_type: TapSighashType::All,
+                annex: None,
+            })
+            .collect();
+        (unsigned, full_agg_spent_outputs(), inputs)
+    }
+
+    fn key(value: &str) -> [u8; 32] {
+        hex(value).try_into().unwrap()
+    }
+
+    #[test]
+    fn multi_party_session_produces_the_vector_transaction() {
+        let (unsigned, spent, inputs) = vector_session();
+        let mut coordinator = Coordinator::new(&unsigned, &spent);
+        let mut participants = Vec::new();
+
+        // Round 1: every participant publishes its public nonce.
+        for (position, input) in inputs.iter().enumerate() {
+            let (participant, pubnonce) = Participant::new(
+                &key(INTERNAL_PRIVKEYS[position]),
+                Some(&key(TAP_TWEAKS[position])),
+                *input,
+                &unsigned,
+                &spent,
+            )
+            .unwrap();
+            coordinator.add_nonce(*input, pubnonce).unwrap();
+            participants.push(participant);
+        }
+
+        // Round 2: the coordinator publishes the session, each participant signs.
+        let session = coordinator.session().unwrap();
+        assert_eq!(session.indices(), [0, 1]);
+        for participant in participants {
+            let index = participant.index();
+            let partial = participant.sign(&session).unwrap();
+            coordinator.add_partial(index, partial).unwrap();
+        }
+
+        let signed = coordinator.finalize().unwrap();
+        verify_key_path_spends(&signed, &spent).unwrap();
+
+        // Nonces are fresh, so the aggregate differs from the vector's. Swapping
+        // the vector's signature back in must reproduce its transaction exactly.
+        let signature: [u8; 64] = hex(VECTOR_FULL_AGG_FINAL)[..64].try_into().unwrap();
+        let mut rebuilt = signed.clone();
+        rebuilt.input[1].witness = Witness::from_slice(&[WitnessElement::Final {
+            mode: AggMode::Full,
+            data: &signature,
+            hash_type: TapSighashType::All,
+        }
+        .encode()]);
+        assert_eq!(serialize(&rebuilt), hex(FULL_AGG_SIGNED_TX));
+    }
+
+    #[test]
+    fn a_key_that_does_not_match_the_output_is_refused() {
+        let (unsigned, spent, inputs) = vector_session();
+        // The right key for the wrong input.
+        let error = Participant::new(
+            &key(INTERNAL_PRIVKEYS[0]),
+            Some(&key(TAP_TWEAKS[0])),
+            inputs[1],
+            &unsigned,
+            &spent,
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(error, SignerError::KeyMismatch(1));
+    }
+
+    #[test]
+    fn a_bad_partial_signature_is_attributed_to_its_signer() {
+        let (unsigned, spent, inputs) = vector_session();
+        let mut coordinator = Coordinator::new(&unsigned, &spent);
+        let mut participants = Vec::new();
+        for (position, input) in inputs.iter().enumerate() {
+            let (participant, pubnonce) = Participant::new(
+                &key(TWEAKED_PRIVKEYS[position]),
+                None,
+                *input,
+                &unsigned,
+                &spent,
+            )
+            .unwrap();
+            coordinator.add_nonce(*input, pubnonce).unwrap();
+            participants.push(participant);
+        }
+        let session = coordinator.session().unwrap();
+
+        let mut partials: Vec<_> = participants
+            .into_iter()
+            .map(|participant| (participant.index(), participant.sign(&session).unwrap()))
+            .collect();
+        let mut tampered = partials[1].1.to_bytes();
+        tampered[31] ^= 1;
+        partials[1].1 = PartialSignature::from_bytes(tampered);
+
+        assert_eq!(
+            coordinator.add_partial(partials[0].0, partials[0].1),
+            Ok(())
+        );
+        assert_eq!(
+            coordinator.add_partial(partials[1].0, partials[1].1),
+            Err(SignerError::InvalidPartialSignature(1))
+        );
+        assert_eq!(
+            coordinator.finalize().unwrap_err(),
+            SignerError::MissingPartialSignature(1)
+        );
     }
 
     #[test]
