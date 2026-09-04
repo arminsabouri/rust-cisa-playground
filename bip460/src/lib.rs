@@ -104,7 +104,50 @@ pub enum WitnessElement<'a> {
     },
 }
 
+// SIGHASH_DEFAULT is only expressible by omitting the byte, so every signature
+// message has exactly one witness encoding.
+fn push_hash_type(out: &mut Vec<u8>, hash_type: TapSighashType) {
+    if hash_type != TapSighashType::Default {
+        out.push(hash_type as u8);
+    }
+}
+
 impl WitnessElement<'_> {
+    // The inverse of parse_witness_element: the single witness stack element
+    // this spend contributes, without the annex.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match self {
+            WitnessElement::OptedOut {
+                signature,
+                hash_type,
+            } => {
+                out.extend_from_slice(*signature);
+                push_hash_type(&mut out, *hash_type);
+            }
+            WitnessElement::HalfAggMember {
+                nonce_share,
+                hash_type,
+            } => {
+                out.extend_from_slice(*nonce_share);
+                push_hash_type(&mut out, *hash_type);
+            }
+            WitnessElement::FullAggMember { hash_type } => {
+                push_hash_type(&mut out, *hash_type);
+            }
+            WitnessElement::Final {
+                mode,
+                data,
+                hash_type,
+            } => {
+                out.extend_from_slice(*data);
+                push_hash_type(&mut out, *hash_type);
+                out.push(mode.as_byte());
+            }
+        }
+        out
+    }
+
     pub fn hash_type(&self) -> TapSighashType {
         match self {
             WitnessElement::OptedOut { hash_type, .. }
@@ -739,6 +782,71 @@ mod tests {
         assert_eq!(
             verify_key_path_spends(&transaction, &full_agg_spent_outputs()),
             Err(VerifyError::GroupSignatureInvalid(AggMode::Full))
+        );
+    }
+
+    // Expected witnesses from keyPathSpending in the wallet test vectors.
+    const VECTOR_FULL_AGG_MEMBER: &str = "01";
+    const VECTOR_FULL_AGG_FINAL: &str = "f00c224cc4e1bb038b1f35d71c28608510236327924d350d75520eb6295eb1908a38b68c0a7b484bc4ac7330ae2f5e909bf25b53fa60131f7d6799d5017311d801bd";
+    const VECTOR_OPTED_OUT: &str = "86a207d61052859ed25d045739ff69f6c94e246c7e95c0bd2dbf951cb75f0ee55e890397180835f8d5aeb8eabef4c9e234b13aa87fe38c96f25001f3b1a0631d01";
+
+    #[test]
+    fn encoding_round_trips_every_form() {
+        let signature = [7u8; 64];
+        let share = [9u8; 32];
+        let elements = [
+            WitnessElement::OptedOut { signature: &signature, hash_type: TapSighashType::Default },
+            WitnessElement::OptedOut { signature: &signature, hash_type: TapSighashType::All },
+            WitnessElement::FullAggMember { hash_type: TapSighashType::Default },
+            WitnessElement::FullAggMember { hash_type: TapSighashType::All },
+            WitnessElement::HalfAggMember { nonce_share: &share, hash_type: TapSighashType::Default },
+            WitnessElement::HalfAggMember { nonce_share: &share, hash_type: TapSighashType::Single },
+            WitnessElement::Final { mode: AggMode::Half, data: &signature, hash_type: TapSighashType::Default },
+            WitnessElement::Final { mode: AggMode::Half, data: &signature, hash_type: TapSighashType::All },
+            WitnessElement::Final { mode: AggMode::Full, data: &signature, hash_type: TapSighashType::Default },
+            WitnessElement::Final { mode: AggMode::Full, data: &signature, hash_type: TapSighashType::AllPlusAnyoneCanPay },
+        ];
+        // The fixed lengths of the ten rows of the BIP's structure table.
+        let lengths = [64, 65, 0, 1, 32, 33, 65, 66, 65, 66];
+
+        for (element, length) in elements.iter().zip(lengths) {
+            let encoded = element.encode();
+            assert_eq!(encoded.len(), length, "{:?}", element);
+            assert_eq!(parse_witness_element(&encoded).unwrap(), *element);
+        }
+    }
+
+    #[test]
+    fn encoding_matches_the_vector_witnesses() {
+        assert_eq!(
+            WitnessElement::FullAggMember {
+                hash_type: TapSighashType::All
+            }
+            .encode(),
+            hex(VECTOR_FULL_AGG_MEMBER)
+        );
+
+        let expected = hex(VECTOR_FULL_AGG_FINAL);
+        let signature: [u8; 64] = expected[..64].try_into().unwrap();
+        assert_eq!(
+            WitnessElement::Final {
+                mode: AggMode::Full,
+                data: &signature,
+                hash_type: TapSighashType::All
+            }
+            .encode(),
+            expected
+        );
+
+        let expected = hex(VECTOR_OPTED_OUT);
+        let signature: [u8; 64] = expected[..64].try_into().unwrap();
+        assert_eq!(
+            WitnessElement::OptedOut {
+                signature: &signature,
+                hash_type: TapSighashType::All
+            }
+            .encode(),
+            expected
         );
     }
 
