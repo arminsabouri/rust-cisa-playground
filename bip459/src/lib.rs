@@ -251,6 +251,11 @@ pub struct WithNonces {
 }
 
 impl Signer<WithNonces> {
+    /// The public nonces this signer must publish before the context is built.
+    pub fn public_nonces(&self) -> (ProjectivePoint, ProjectivePoint) {
+        (self.r1.1, self.r2.1)
+    }
+
     pub fn context_item(&self, message: Message) -> ContextItem {
         (self.signer_key.public_key(), message, self.r1.1, self.r2.1)
     }
@@ -400,12 +405,24 @@ pub fn serialize_signature(group_nonce: &ProjectivePoint, s: &Scalar) -> [u8; 64
     out
 }
 
-fn lift_x_bytes(x: &[u8]) -> Option<ProjectivePoint> {
+/// Lifts an x-only encoding to the point with even Y, as lift_x is defined in
+/// BIP 340. Returns None if no curve point has this x coordinate.
+pub fn lift_x_bytes(x: &[u8; 32]) -> Option<PublicKey> {
     let mut compressed = [0u8; 33];
     compressed[0] = 0x02;
-    compressed[1..].copy_from_slice(x.try_into().ok()?);
-    let encoded = EncodedPoint::from_bytes(compressed).ok()?;
+    compressed[1..].copy_from_slice(x);
+    parse_point(&compressed)
+}
+
+/// Parses a SEC1 compressed point, as used for public nonces.
+pub fn parse_point(bytes: &[u8; 33]) -> Option<ProjectivePoint> {
+    let encoded = EncodedPoint::from_bytes(bytes).ok()?;
     Option::from(ProjectivePoint::from_encoded_point(&encoded))
+}
+
+/// Serializes a point SEC1 compressed.
+pub fn serialize_point(point: &ProjectivePoint) -> [u8; 33] {
+    cbytes(point)
 }
 
 fn scalar_from_bytes(bytes: &[u8]) -> Option<Scalar> {
@@ -424,7 +441,11 @@ pub fn verify_serialized(
     if pubkeys.is_empty() || pubkeys.len() != messages.len() {
         return false;
     }
-    let Some(group_nonce) = lift_x_bytes(&signature[..32]) else {
+    let Some(group_nonce) = signature[..32]
+        .try_into()
+        .ok()
+        .and_then(|x: &[u8; 32]| lift_x_bytes(x))
+    else {
         return false;
     };
     let Some(s) = scalar_from_bytes(&signature[32..]) else {
