@@ -347,3 +347,81 @@ impl<'a> Coordinator<'a> {
         Ok(signed)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn};
+    use k256::ProjectivePoint;
+
+    fn output_for(secret: &[u8; 32]) -> TxOut {
+        let key = serialize_xonly(&(ProjectivePoint::GENERATOR * scalar(secret).unwrap()));
+        let mut script = vec![0x52, 0x20];
+        script.extend_from_slice(&key);
+        TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::from_bytes(script),
+        }
+    }
+
+    #[test]
+    fn two_signers_produce_a_verifiable_aggregate() {
+        let keys = [[1u8; 32], [2u8; 32]];
+        let spent: Vec<TxOut> = keys.iter().map(output_for).collect();
+        let unsigned = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: (0..2)
+                .map(|_| TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(150_000),
+                script_pubkey: spent[0].script_pubkey.clone(),
+            }],
+        };
+        let inputs: Vec<SessionInput> = (0..2)
+            .map(|index| SessionInput {
+                index,
+                hash_type: TapSighashType::Default,
+                annex: None,
+            })
+            .collect();
+
+        let mut coordinator = Coordinator::new(&unsigned, &spent);
+        let mut participants = Vec::new();
+        for (position, input) in inputs.iter().enumerate() {
+            let (participant, pubnonce) =
+                Participant::new(&keys[position], None, *input, &unsigned, &spent).unwrap();
+            coordinator.add_nonce(*input, pubnonce).unwrap();
+            participants.push(participant);
+        }
+
+        let session = coordinator.session().unwrap();
+        for participant in participants {
+            let index = participant.index();
+            let partial = participant.sign(&session).unwrap();
+            coordinator.add_partial(index, partial).unwrap();
+        }
+        let signed = coordinator.finalize().unwrap();
+
+        let aggregate: [u8; 64] = signed.input[1].witness.nth(0).unwrap()[..64]
+            .try_into()
+            .unwrap();
+        let pubkeys: Vec<[u8; 32]> = spent
+            .iter()
+            .map(|output| witness_v2_program(&output.script_pubkey).unwrap())
+            .collect();
+        let messages: Vec<Message> = inputs
+            .iter()
+            .map(|input| message_for(&unsigned, &spent, *input).unwrap())
+            .collect();
+        assert!(bip459::verify_serialized(&pubkeys, &messages, &aggregate));
+    }
+}
