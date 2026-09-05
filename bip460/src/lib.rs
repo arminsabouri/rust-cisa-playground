@@ -7,7 +7,7 @@ use bitcoin::hashes::{Hash, HashEngine};
 use bitcoin::sighash::{
     Annex, Prevouts, SigningDataError, SighashCache, TapSighash, TapSighashType, TaprootError,
 };
-use bitcoin::{Script, Transaction, TxOut};
+use bitcoin::{Script, ScriptBuf, Transaction, TxOut};
 
 pub use bip459::Message;
 
@@ -137,6 +137,13 @@ impl WitnessElement<'_> {
 
 // Witness version 2 outputs have a scriptPubKey of OP_2 <32-byte program>.
 pub const WITNESS_V2_PREFIX: [u8; 2] = [0x52, 0x20];
+
+pub fn witness_v2_script_pubkey(output_key: &[u8; 32]) -> ScriptBuf {
+    let mut script = Vec::with_capacity(34);
+    script.extend_from_slice(&WITNESS_V2_PREFIX);
+    script.extend_from_slice(output_key);
+    ScriptBuf::from_bytes(script)
+}
 
 pub fn witness_v2_program(script_pubkey: &Script) -> Option<[u8; 32]> {
     let bytes = script_pubkey.as_bytes();
@@ -387,6 +394,47 @@ mod tests {
         hex(value).try_into().unwrap()
     }
 
+    fn internal_key(secret: &str) -> [u8; 32] {
+        bip459::serialize_xonly(&(k256::ProjectivePoint::GENERATOR * scalar(secret)))
+    }
+
+    #[test]
+    fn taproot_key_matches_the_vector() {
+        // internal key, expected tweak, expected output key
+        for (internal, tweak, output_key) in [
+            (
+                "34b703e82bfdedfbab012da7a34767456c3f85524171663df7c0aaf227276901",
+                "4821522480fda0d8eeab11f09a642cae24605302c3ccda3f590e323f81d6fc0b",
+                "4049ce224d4b6407e9c7864e88d8020996beb04663cd1596bf4ff8ab335bc57b",
+            ),
+            (
+                "020be368e697e135d54cd88e86b42c0b5e3e72d4b0c77632a8a4d0441203ded5",
+                TAP_TWEAKS[0],
+                "8640c68f13b51a1e63dfc5cc41202cca21c18f1f9d7037c2cbec3f03f63e52e4",
+            ),
+            (
+                "0fef9c578d084fb5f7c8fe48a570dc644609cc012a356fdd0c056f674f9455c0",
+                TAP_TWEAKS[1],
+                "18b6491469cc78b764b01669b0a5a4e892f57e8c1b20b89bc1ca6dce3e881b51",
+            ),
+        ] {
+            let derived = taproot_key(&key(internal), None).unwrap();
+            assert_eq!(derived.tweak, key(tweak));
+            assert_eq!(derived.output_key, key(output_key));
+            assert_eq!(
+                witness_v2_script_pubkey(&derived.output_key).to_bytes(),
+                hex(&format!("5220{}", output_key))
+            );
+        }
+
+        // The internal keys the vector signs with derive the same output keys.
+        for position in 0..2 {
+            let derived =
+                taproot_key(&internal_key(INTERNAL_PRIVKEYS[position]), None).unwrap();
+            assert_eq!(derived.tweak, key(TAP_TWEAKS[position]));
+        }
+    }
+
     #[test]
     fn multi_party_session_produces_the_vector_transaction() {
         let (unsigned, spent, inputs) = vector_session();
@@ -395,9 +443,12 @@ mod tests {
 
         // Round 1: every participant publishes its public nonce.
         for (position, input) in inputs.iter().enumerate() {
+            let tweak = taproot_key(&internal_key(INTERNAL_PRIVKEYS[position]), None)
+                .unwrap()
+                .tweak;
             let (participant, pubnonce) = Participant::new(
                 &key(INTERNAL_PRIVKEYS[position]),
-                Some(&key(TAP_TWEAKS[position])),
+                Some(&tweak),
                 *input,
                 &unsigned,
                 &spent,

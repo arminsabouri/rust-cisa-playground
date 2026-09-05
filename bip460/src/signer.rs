@@ -4,7 +4,10 @@ use bip459::{
     serialize_signature, serialize_xonly,
 };
 use bitcoin::hashes::Hash;
+use bitcoin::key::{TapTweak, UntweakedPublicKey};
+use bitcoin::secp256k1::Secp256k1;
 use bitcoin::sighash::{Annex, Prevouts, SighashCache, TapSighashType};
+use bitcoin::taproot::{TapNodeHash, TapTweakHash};
 use bitcoin::{Transaction, TxOut, Witness};
 use k256::Scalar;
 use k256::elliptic_curve::PrimeField;
@@ -14,6 +17,7 @@ use crate::{AggMode, WitnessElement, aggregated_sighash, witness_v2_program};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignerError {
     InvalidSecretKey,
+    InvalidInternalKey,
     InvalidTweak,
     InvalidPubNonce(usize),
     InvalidPartialSignature(usize),
@@ -52,6 +56,31 @@ impl PartialSignature {
     pub fn to_bytes(&self) -> [u8; 32] {
         self.0
     }
+}
+
+/// The taproot tweak and output key of a witness v2 output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaprootKey {
+    pub tweak: [u8; 32],
+    pub output_key: [u8; 32],
+}
+
+/// Derives the BIP 341 tweak and output key for an internal key, which is what
+/// a witness v2 output commits to and what the signer must sign under.
+pub fn taproot_key(
+    internal_key: &[u8; 32],
+    merkle_root: Option<TapNodeHash>,
+) -> Result<TaprootKey, SignerError> {
+    let internal =
+        UntweakedPublicKey::from_slice(internal_key).map_err(|_| SignerError::InvalidInternalKey)?;
+    let tweak = TapTweakHash::from_key_and_tweak(internal, merkle_root)
+        .to_scalar()
+        .to_be_bytes();
+    let (output_key, _parity) = internal.tap_tweak(&Secp256k1::verification_only(), merkle_root);
+    Ok(TaprootKey {
+        tweak,
+        output_key: output_key.serialize(),
+    })
 }
 
 // One input's place in the signing session.
