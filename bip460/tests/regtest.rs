@@ -3,7 +3,7 @@
 mod harness;
 
 use bitcoin::{Amount, TxOut};
-use harness::{MiniWallet, Regtest};
+use harness::{MiniWallet, Regtest, bytes_to_hex};
 
 /// Exercises the harness itself: mine, distribute to n wallets, then have one
 /// wallet spend everything it holds and confirm the spend.
@@ -40,6 +40,7 @@ async fn two_signers_full_aggregation_spend_is_accepted() {
         witness_v2_script_pubkey,
     };
     use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::serialize;
     use bitcoin::key::Keypair;
     use bitcoin::secp256k1::{Secp256k1, SecretKey};
     use bitcoin::sighash::TapSighashType;
@@ -86,6 +87,7 @@ async fn two_signers_full_aggregation_spend_is_accepted() {
             })
             .collect(),
     );
+    println!("funding tx:    {}", bytes_to_hex(&serialize(&funding)));
     let accept = regtest.test_accept(&funding).await.expect("accept funding");
     assert_eq!(accept["allowed"], true, "funding rejected: {accept}");
     regtest.confirm(&funding).await.expect("confirm funding");
@@ -148,6 +150,7 @@ async fn two_signers_full_aggregation_spend_is_accepted() {
     assert_eq!(last.len(), 65);
     assert_eq!(*last.last().expect("marker"), FULL_AGG_MARKER);
 
+    println!("cisa spend tx: {}", bytes_to_hex(&serialize(&signed)));
     let accept = regtest.test_accept(&signed).await.expect("accept spend");
     assert_eq!(accept["allowed"], true, "spend rejected: {accept}");
     let txid = regtest.confirm(&signed).await.expect("confirm spend");
