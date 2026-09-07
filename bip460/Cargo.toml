@@ -7,3 +7,11 @@ edition = "2024"
 bip459 = { path = "../bip459" }
 bitcoin = "0.32"
 k256 = { version = "0.13.4", features = ["arithmetic"] }
+
+[features]
+regtest = []
+
+[dev-dependencies]
+bitcoind-async-client = { version = "0.15", features = ["raw_rpc"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
