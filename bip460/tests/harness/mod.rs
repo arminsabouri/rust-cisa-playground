@@ -7,6 +7,7 @@
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bitcoin::consensus::{deserialize, serialize};
@@ -21,6 +22,11 @@ use bitcoin::{
 };
 use bitcoind_async_client::{Auth, Client};
 use serde_json::{Value, json};
+use tokio::sync::{Mutex, OwnedMutexGuard};
+
+// Every test shares one node, so they take turns rather than racing over the
+// mempool and the chain tip.
+static NODE: LazyLock<Arc<Mutex<()>>> = LazyLock::new(|| Arc::new(Mutex::new(())));
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -166,6 +172,7 @@ impl MiniWallet {
 }
 
 pub struct Regtest {
+    _guard: OwnedMutexGuard<()>,
     node: Client,
     miner: Client,
     miner_address: String,
@@ -174,6 +181,7 @@ pub struct Regtest {
 impl Regtest {
     /// Connects, creates a throwaway Core wallet and mines it spendable coins.
     pub async fn setup() -> Result<Self> {
+        let _guard = NODE.clone().lock_owned().await;
         let url = rpc_url();
         let node = client_for(url.clone())?;
 
@@ -187,6 +195,7 @@ impl Regtest {
 
         let miner_address: String = miner.call_raw("getnewaddress", &[]).await?;
         let regtest = Regtest {
+            _guard,
             node,
             miner,
             miner_address,
@@ -224,11 +233,9 @@ impl Regtest {
             .call_raw("sendmany", &[json!(""), Value::Object(targets)])
             .await?;
 
-        let raw: String = self
-            .node
-            .call_raw("getrawtransaction", &[json!(txid)])
-            .await?;
-        let funding: Transaction = deserialize(&hex_to_bytes(&raw)?)?;
+        let info: Value = self.miner.call_raw("gettransaction", &[json!(txid)]).await?;
+        let raw = info["hex"].as_str().ok_or("gettransaction returned no hex")?;
+        let funding: Transaction = deserialize(&hex_to_bytes(raw)?)?;
         for wallet in wallets.iter_mut() {
             wallet.receive(&funding);
         }
